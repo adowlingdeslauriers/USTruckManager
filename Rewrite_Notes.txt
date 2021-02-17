@@ -1,0 +1,4 @@
+Change center to JSON of packages and JSON of misc data
+Have both exported to file and opened as needed
+Change upload to google sheets to be a button
+Add stripping to USGR entry numbers
