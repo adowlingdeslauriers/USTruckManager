@@ -1,0 +1,71 @@
+{
+    "BoL": "4295197",
+    "PAPS": "001289",
+    "date": "2021-02-16",
+    "emailRecipients": [
+        {
+            "emailAddress": "chris@stalco.ca"
+        },
+        {
+            "emailAddress": "naseer@stalco.ca"
+        },
+        {
+            "emailAddress": "TLCUS@tri-ad.ca"
+        },
+        {
+            "emailAddress": "diana@stalco.ca"
+        },
+        {
+            "emailAddress": "exports@tri-ad.ca"
+        },
+        {
+            "emailAddress": "lcollier@tri-ad.ca"
+        },
+        {
+            "emailAddress": "tlc@tri-ad.ca"
+        },
+        {
+            "emailAddress": "lorne@stalco.ca"
+        },
+        {
+            "emailAddress": "mcole@IMSDirect.com"
+        },
+        {
+            "emailAddress": "SSchiano@imsdirect.com"
+        },
+        {
+            "emailAddress": "dcox@tri-ad.ca"
+        },
+        {
+            "emailAddress": "release@cbcustomsbrokerage.com"
+        },
+        {
+            "emailAddress": "james@stalco.ca"
+        },
+        {
+            "emailAddress": "Sai@stalco.ca"
+        },
+        {
+            "emailAddress": "bayotte@tri-ad.ca"
+        },
+        {
+            "emailAddress": "mAyotte@tri-ad.ca"
+        },
+        {
+            "emailAddress": "slima@tri-ad.ca"
+        },
+        {
+            "emailAddress": "dcrocker@IMSDirect.com"
+        },
+        {
+            "emailAddress": "ELindo@IMSDirect.com"
+        },
+        {
+            "emailAddress": "flavia@stalco.ca"
+        },
+        {
+            "emailAddress": "alex@stalco.ca"
+        }
+    ],
+    "fedexContact": "jennifer.dressel@fedex.com"
+}
