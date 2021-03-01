@@ -1,25 +1,27 @@
+''' TODO
+-Add Commodities from CleanCommodities to Config
+-Change Mainloop to filter based on SKU not client
+-Add Carriers to Config
+-Auto update PAPS/BoL according to Carrier Tracking.xlsx
+-RE-add Error File printout / textbox
+-Change validateJSON override address to be in CONFIG (in case we move on from IMS)
+-Set per-name 800$ limit on S321 manifests
+-Throw error when 800$ limit is exceeded
+-Add manifest emailing
+-Add destination to CONFIG
+-Data validation on Gaylord/Order removal
+-Throw errors if a gaylord/order removal removes nothins
+-Check for duplicate SCNs in historic orders
+-Test if executable requires libraries
+-Add Last Updated to Master_FDA_LIST
 '''
-If you're reading this, I'm sorry for the mess. This is the 3rd major release of a widget that keeps growing and growing in scope.
 
-TODO:
--Future-proof anything that uses a CSV and relies on columns to be in a specific place
--Add client/carrier/gaylord support to JSON-CSV and CSV-JSON conversion
--Better error messages
--Better error-handling
--Clean up this spaghetti
-'''
-
-from appJar import gui
 import json
 from datetime import date
 import time
 import os
 import csv
 import sys
-from openpyxl import Workbook
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
-from reportlab.lib.utils import Image
 import traceback
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -28,21 +30,524 @@ from pathlib import Path
 from email.mime.base import MIMEBase
 from email.utils import COMMASPACE, formatdate
 from email import encoders
-import shutil
 import re
-import string
+import shutil
+
+#installable through PiP
+import openpyxl as pyxl
+from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
+from reportlab.lib.utils import Image
+
+#Optional library
+#import Google_API_Tool as gAPI
+
+#Optional library, included by /appJar/ folder
+from appJar import gui
 
 ### Functions
 
-def createProForma():
-	print("\n>Attempting to Create ProForma")
-	global detailed_report_json
+#TMP
+def testButton():
+	app.setEntry("ACEManifestFileEntry", "W:/Logistics/Tools/USTM/1-ACE.json")
+	app.setEntry("batchesFileEntry", "W:/Logistics/Tools/USTM/2-Detailed_Report.xlsx")
+	app.setEntry("XLSXReportFileEntry", "W:/Logistics/Tools/USTM/3-XLSX_Report.xlsx")
+	#doEverything()
+
+## Mainline Functions
+
+def doEverything():
+	#Creates the core data used for every other function
+	readMasterMetadata() #Merges XLSX report (carrier, client, tracking number, close date) with ACE report (shipping info) to create one unified data source
+	constructACE() #Merges XLSX report (carrier, client, tracking number, close date) with ACE report (shipping info) to create one unified data source
+	               #Then filters out all ACE entries that don't match a batch scan. Also outputs ACE
+	assignGaylords() #Creates a list of all gaylords, which carrier (eg. DHL, USPS, FedEx) they belong to, if it has FDA-regulated products
+
+	#Uses the core data to produce paperwork 
+	createDetailedReport() #The report Tri-Ad uses to find packages when searched
+	createProForma() #Creates the XLSX file we upload to SmartBorder to create our Proforma invoice
+	createLoadSheet() #Creates a useful but non-necessary info sheet
+	createBoL() #Creates the Bill of lading for this load
+	createIMSBoL() #Creates the Bill of Lading for IMS
+	#updateIMSTracker() #Disabled currently as the google apps API keeps giving misleading errors
+
+	app.infoBox("Done", "All paperwork completed!")
+
+def readMasterMetadata():
+	global master_metadata
+	global config_data
+	master_metadata["date"] = app.getEntry("Date:")
+	master_metadata["BoL"] = app.getEntry("BoL #:")
+	master_metadata["PAPS"] = app.getEntry("PAPS #:")
+	master_metadata["SCAC"] = config_data["SCAC"]
+	app.setEntry("File Date:", master_metadata["date"])
+	createOutputFolder(master_metadata["date"])
+
+def createConsolidatedJSON():
+	#Opens the ACE and XLSX report. Matches entries in the two based on order IDs. Takes the client/carrier/close date data from the XLSX and adds it to the ACE
+	global master_ACE_data
+
+	#Loads unprocessed ACE manifest
 	try:
-		if detailed_report_json == {}: raise Exception
+		ACE_data = []
+		with open(app.getEntry("ACEManifestFileEntry"), "r") as ACE_file:
+			ACE_data = json.load(ACE_file)
+	except: errorBox("Error loading ACE Manifest.\nFile open in another program?")
+
+	#Loads XLSX Report
+	try:
+		file_path = app.getEntry("XLSXReportFileEntry")
+		worksheet = pyxl.load_workbook(file_path).active
+
+		#Load Header
+		XLSX_header = ()
+		for row in worksheet.values: #Looks odd but openpyxl doesn't like to just _let_ you access the values of the first row
+			XLSX_header = row
+			break #Effectively sets XLSX_header <= row[0]
+
+		global config_data
+		ORDERID_column_index = -1
+		client_name_column_index = -1
+		carrier_column_index = -1
+		ship_date_column_index = -1
+		tracking_number_column_index = -1
+
+		#Figures out where all the important columns are, in order to load that data
+		#Can change the names of the important columns in CONFIG.json
+		for i, cell in enumerate(XLSX_header):
+			if XLSX_header[i] == config_data["XLSX_Report_ORDERID_column_name"]:
+				ORDERID_column_index = i
+			if XLSX_header[i] == config_data["XLSX_Report_client_name_column_name"]:
+				client_name_column_index = i
+			if XLSX_header[i] == config_data["XLSX_Report_carrier_column_name"]:
+				carrier_column_index = i
+			if XLSX_header[i] == config_data["XLSX_Report_ship_date_column_name"]:
+				ship_date_column_index = i
+			if XLSX_header[i] == config_data["XLSX_Report_tracking_number_column_name"]:
+				tracking_number_column_index = i
+
+		#Loads unfiltered Data
+		XLSX_data = []
+		for row in worksheet.values:
+			XLSX_data.append(row)
+
+		#Matches XLSX Report data to ACE Manifest data using ORDERID
+		#Then adds the important data from the XLSX report to the ACE
+		consolidated_ACE_data = []
+		for XLSX_line in XLSX_data:
+			for json_entry in ACE_data:
+				if XLSX_line[ORDERID_column_index] == json_entry["ORDERID"]: #TODO
+					json_entry["client"] = XLSX_line[client_name_column_index]
+					json_entry["carrier"] = XLSX_line[carrier_column_index]
+					json_entry["closeDate"] = XLSX_line[ship_date_column_index]
+					json_entry["trackingNumber"] = XLSX_line[tracking_number_column_index]
+					consolidated_ACE_data.append(json_entry)
+		return consolidated_ACE_data
+	except:	errorBox("Error loading XLSX data.\nFile open in another program?")
+
+def loadFDAClients():
+	try:
+		#NOTE: Currently if a client has FDA-regulated goods, none of their products can go through Section 321 (aka end up on the ACE)
+		#This may possibly change in the future
+		FDA_clients_list = []
+		with open("resources/FDA_CLIENTS.json", "r") as clients_file:
+			json_data = json.load(clients_file)
+			for client in json_data["clients"]:
+				FDA_clients_list.append(client["name"])
+		return FDA_clients_list
+	except:
+		errorBox("Error loading resources/FDA_CLIENTS.json.\nFile missing/open in another program?")
+
+def loadBatchesFile():
+	#Can load either the (old) Batches Scans or the (newly implemented) Detailed Report
+	global config_data
+
+	if app.getEntry("batchesFileEntry")[-4:] == ".csv":
+		try:
+			#Loads CSV Data
+			csv_data = []
+			with open(app.getEntry("batchesFileEntry"), "r") as batches_file:
+				csv_reader = csv.reader(batches_file, delimiter = ",")
+				for row in csv_reader:
+					csv_data.append(row)
+
+			#Reads the ehader to figure out which column is for Batches and which is for the gaylord its assigned to
+			csv_header = csv_data[0]
+			batch_index = -1
+			gaylord_index = -1
+			batches_data = []
+			for i, cell in enumerate(csv_header):
+				if cell == config_data["BATCHES_SCANS_batch_column_name"]:
+					batch_index = i
+				if cell == config_data["BATCHES_SCANS_gaylord_column_name"]:
+					gaylord_index = i
+			csv_data.pop(0) #Remove header from CSV data
+
+			#Builds the list of batch-gaylord assignments
+			for row in csv_data:
+				batches_data.append({"batch": row[batch_index], "gaylord": row[gaylord_index]})
+			return batches_data
+		except:
+			errorBox("Error loading Batches Scans.\nFile open in another program?")
+
+	elif app.getEntry("batchesFileEntry")[-5:] == ".xlsx": #If user is uploading Detailed Report
+		try:
+
+			file_path = app.getEntry("batchesFileEntry")
+			workbook = pyxl.load_workbook(file_path)
+			worksheet = workbook[config_data["Detailed_Report_scan_sheet_name"]]
+
+			#Load Header from Detailed Report
+			header = ()
+			for row in worksheet.values:
+				header = row
+				break
+
+			#Figure out where the batch column is and where the gaylord column is
+			batch_index = -1
+			gaylord_index = -1
+			for i, cell in enumerate(header):
+				if cell == config_data["Detailed_Report_batch_column_name"]:
+					batch_index = i
+				if cell == config_data["Detailed_Report_gaylord_column_name"]:
+					gaylord_index = i
+
+			#Loads raw XLSX values
+			XLSX_data = []
+			for row in worksheet.values:
+				XLSX_data.append(row)
+			XLSX_data.pop(0) # Removes header
+
+			#Builds the list of batch-gaylord assignments
+			batches_data = []
+			for row in XLSX_data:
+				if row[batch_index] != None and row[gaylord_index] != None:
+					batches_data.append({"batch": str(row[batch_index]), "gaylord": str(row[gaylord_index])})
+
+			return batches_data
+
+		except:
+			errorBox("Error loading Detailed Report.\nFile open in another program?")
+
+def constructACE():
+	global master_ACE_data #The outputted master ACE with all products
+	global master_metadata #Details about the shipment (eg. date, BoL #, PAPS #, etc)
+	
+	batches_data = loadBatchesFile()
+	FDA_clients_list = loadFDAClients()
+
+	#compare lists and build outputs
+	master_ACE_data = [] 
+	good_json = [] #The ACE that gets outputted, without FDA products
+	good_batches = [] #Used to identify batches that did not match and ACE entries
+	consolidated_json = createConsolidatedJSON() #Adds client/carrier/close date to ACE manifest for sorting purposes
+
+	#The main loop that started this entire program
+	#Matches Batches Scans to ACE entries
+	#Only ACE entries that match a batch scan are added to the out-bound ACE
+	for json_entry in consolidated_json:
+		for row in batches_data:
+			if json_entry["BATCHID"] == row["batch"] or json_entry["ORDERID"] == row["batch"]: #If there's a match
+				if json_entry["client"] not in FDA_clients_list: #If the product is not commercially cleared
+					json_entry["GAYLORD"] = row["gaylord"] #Append the Gaylord assignment to the entry
+					good_json.append(json_entry) #Append to the ACE that goes to BorderConnect
+					master_ACE_data.append(json_entry) #Append to the master ACE used for lots of stuff
+					good_batches.append(row["batch"]) #Used to identify which batches aren't matched
+				else: #If it is commercially cleared
+					json_entry["GAYLORD"] = row["gaylord"]
+					#good_json.append(json_entry) #Doesn't go on the JSON that gets uploaded to BorderConnect, only Detailed Report (and the ProForma)
+					master_ACE_data.append(json_entry)
+					good_batches.append(row["batch"])
+					
+	good_json = validate_json(good_json) #Removes duplicates and common errors that prevent ACE uploading
+
+	#Warn unmatched JSON entries
+	unmatched_json_list = []
+	unmatched_json_uniques = []
+	for json_entry in consolidated_json:
+		if json_entry not in master_ACE_data and json_entry["BATCHID"] not in good_batches:
+			if json_entry["BATCHID"] not in unmatched_json_uniques:
+				unmatched_json_uniques.append(json_entry["BATCHID"])
+				unmatched_json_list.append({"BATCHID": json_entry['BATCHID'], "closeDate": json_entry['closeDate'], "client": json_entry["client"]})
+				#print("Unmatched JSON Entry: {} {} {}".format(json_entry['BATCHID'].ljust(10, " "), json_entry['closeDate'].ljust(22, " "), json_entry["client"]))
+	#Send out an errorBox with unmatched JSON entries
+	if unmatched_json_list != []:
+		unmatched_json_list.sort(key = lambda x: x["closeDate"])
+		print("\n>Printing Unmatched JSON Entries")
+		print("If an order below is from today, it is likely a missing pick ticket that must be found and scanned")
+		_out_text = "Unmatched JSON Entries\nIf an order below is from today, it is likely a missing pick ticket that must be found and scanned\n"
+		for line in unmatched_json_list:
+			_out_text += "\nUnmatched JSON Entry: {} {} {}".format(line['BATCHID'].ljust(10, " "), line['closeDate'].ljust(22, " "), line["client"])
+			print("Unmatched JSON Entry: {} {} {}".format(line['BATCHID'].ljust(10, " "), line['closeDate'].ljust(22, " "), line["client"]))
+		errorBox(_out_text)
+
+	#Warn unmatched Batch Scans
+	unmatched_batch_list = []
+	unmatched_batch_uniques = []
+	for row in batches_data:
+		if row["batch"] not in good_batches:
+			if row["batch"] not in unmatched_batch_uniques:
+				unmatched_batch_uniques.append(row["batch"])
+				unmatched_batch_list.append({"batch": row["batch"], "gaylord": row["gaylord"]})
+				#print("Unmatched batch: {} {}".format(row["batch"].ljust(8, " "), row["gaylord"]))
+	#Send out an errorBox with unmatched batches
+	if unmatched_batch_list != []:
+		print("\n>Printing Unmatched Batches")
+		print("Use the Batches page in Techship to find out what manfiest these belong to, and include them in the ACE")
+		_out_text = "Unmatched Batches\nUse the Batches page in Techship to find out what manfiest these belong to, and include them in the ACE"
+		for line in unmatched_batch_list:
+			_out_text += "\nUnmatched batch: {} {}".format(line["batch"].ljust(8, " "), line["gaylord"])
+			print("Unmatched batch: {} {}".format(line["batch"].ljust(8, " "), line["gaylord"]))
+		errorBox(_out_text)
+
+	#Package Count
+	package_count = len(master_ACE_data)
+	master_metadata["packageCount"] = package_count
+	master_metadata["totalWeight"] = int(package_count // 2.20462) #Assumes 1 package ~= 1 lb, then converted to KG
+	
+	#Print ACE Manifest
+	with open(master_metadata["date"] + os.sep + master_metadata["date"] + "-ACE.json", "w") as good_json_file:
+		json.dump(good_json, good_json_file, indent = 4)
+
+def validate_json(in_json):
+	#Removes duplicate entries from the ACE
+	#Also automatically corrects a lot of errors that may prevent the ACE from being accepted by BorderConnect
+
+	global config_data
+	out_json = []
+
+	# Get rid of duplicates
+	for entry in in_json:
+
+		#LUS tickets can be split eg. "G1,2"
+		#This method assigns the entry to the first gaylord (eg. G1) if it belongs to USPS and the second gaylord (eg. G2) otherwise
+		if entry["client"] == "LUS Brands" and "," in entry["GAYLORD"]:
+			if entry["carrier"] == "EHUB":
+				entry["GAYLORD"] = entry["GAYLORD"].split(",")[0]
+			else:
+				entry["GAYLORD"] = "G" + entry["GAYLORD"].split(",")[1].replace("G", "")
+		elif "," in entry["GAYLORD"]:
+			app.errorBox("ErrorBox", "WARNING! Non-LUS pick ticket assigned to multiple gaylords!")
+
+		#Replaces SCAC (Carrier code) in SCN (Shipment Control Number)
+		entry["shipmentControlNumber"] = entry["shipmentControlNumber"].replace("TAIW", config_data["SCAC"])
+		
+		#Override International Orders (set consignee to IMS)
+		if entry["consignee"]["address"]["country"] != "US":
+			entry["consignee"]["address"]["addressLine"] = "2540 Walden Ave Suite 450"
+			entry["consignee"]["address"]["country"] = "US"
+			entry["consignee"]["address"]["city"] = "Buffalo"
+			entry["consignee"]["address"]["stateProvince"] = "NY"
+			entry["consignee"]["address"]["postalCode"] = "14225"
+
+		#Validate Name
+		if len(entry["consignee"]["name"]) <= 2:
+			entry["consignee"]["name"] = entry["consignee"]["name"].ljust(3, "A")
+		elif len(entry["consignee"]["name"]) >= 60:
+			entry["consignee"]["name"] = entry["consignee"]["name"][:59]
+		#Validate Address
+		if len(entry["consignee"]["address"]["addressLine"]) <= 2:
+			entry["consignee"]["address"]["addressLine"] = entry["consignee"]["address"]["addressLine"].ljust(3, "A")
+		elif len(entry["consignee"]["address"]["addressLine"]) >= 55:
+			entry["consignee"]["address"]["addressLine"] = entry["consignee"]["address"]["addressLine"][:54]
+		#Validate City
+		if len(entry["consignee"]["address"]["city"]) <= 3:
+			entry["consignee"]["address"]["city"] = entry["consignee"]["address"]["city"].ljust(2, "A")
+		elif len(entry["consignee"]["address"]["city"]) >= 30:
+			entry["consignee"]["address"]["city"] = entry["consignee"]["address"]["city"][:29]
+		#Validate State
+		states_list = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "AS", "DC", "GU", "MP", "PR", "VI"]
+		if entry["consignee"]["address"]["stateProvince"] not in states_list:
+			entry["consignee"]["address"]["stateProvince"] = "NY"
+		#Validate Zip
+		if len(entry["consignee"]["address"]["postalCode"]) != 5:
+			entry["consignee"]["address"]["postalCode"] = entry["consignee"]["address"]["postalCode"].rjust(5, "0")
+
+		#Clean non-alphanumeric Characters
+		entry["consignee"]["name"] = cleanString(entry["consignee"]["name"])
+		entry["consignee"]["address"]["addressLine"] = cleanString(entry["consignee"]["address"]["addressLine"])
+		entry["consignee"]["address"]["city"] = cleanString(entry["consignee"]["address"]["city"])
+
+		#Check for duplicates
+		if entry not in out_json:
+			out_json.append(entry)
+	return out_json
+
+def assignGaylords():
+	#Figures out which gaylords go where, how many total, and carrying what
+	global master_metadata
+	global master_ACE_data
+	unique_gaylords_list = []
+	master_metadata["gaylordsAssignments"] = []
+
+	for entry in master_ACE_data:
+		#Clean it first
+		if len(entry["GAYLORD"]) == 2:
+			entry["GAYLORD"] = "G0" + entry["GAYLORD"][-1]
+		#Add it to the uniques list
+		match = False
+		for unique_gaylord in unique_gaylords_list:
+			if entry["GAYLORD"] == unique_gaylord["id"]:
+				match = True
+		if not match:
+			unique_gaylords_list.append({"id": entry["GAYLORD"], "hasFDA": False, "hasUSPS": False, "hasDHL": False, "hasFedex": False, "packages": 0})
+	
+	#For every gaylord it checks the master file to see where the gaylord is heading and if it has FDA products
+	FDA_clients_list = loadFDAClients()
+	for entry in master_ACE_data:
+		for line in unique_gaylords_list:
+			if entry["GAYLORD"] == line["id"]: #Will match only one gaylord
+				#Now set flags
+				line["packages"] += 1
+				if entry["carrier"] == "DHLGLOBALMAIL" or entry["carrier"] == "DHLGLOBALMAILV4":
+					line["hasDHL"] = True
+				elif entry["carrier"] == "FEDEX":
+					line["hasFedex"] = True
+				elif entry["carrier"] == "EHUB":
+					line["hasUSPS"]= True
+				else:
+					errorBox("Package with Order ID {} found without carrier".format(entry["ORDERID"]))
+				if entry["client"] in FDA_clients_list:
+					line["hasFDA"] = True
+
+	#Checks if the gaylord has multiple carriers assigned
+	for line in unique_gaylords_list:
+		out = []
+		out.append(line["id"])
+
+		carriers_count = 0
+		if line["hasUSPS"]: carriers_count += 1
+		if line["hasDHL"]: carriers_count += 1
+		if line["hasFedex"]: carriers_count += 1
+
+		if carriers_count != 1:
+			out.append("ERROR")
+			errorBox("Multiple carriers found for {}".format(line["id"]))
+		elif line["hasUSPS"]: out.append("EHUB")
+		elif line["hasDHL"]: out.append("DHLGLOBALMAIL")
+		elif line["hasFedex"]: out.append("FEDEX")
+
+		if line["hasFDA"]: out.append("FDA")
+		else: out.append("")
+
+		out.append(line["packages"])
+		master_metadata["gaylordsAssignments"].append(out)
+
+	master_metadata["gaylordsAssignments"].sort(key = lambda x: x[0])
+
+	#Count the amount of Gaylords
+	usps_count = 0
+	dhl_count = 0
+	fedex_count = 0
+	for gaylord in master_metadata["gaylordsAssignments"]:
+		if "EHUB" in gaylord:
+			usps_count = usps_count + 1
+		elif "FEDEX" in gaylord:
+			fedex_count = fedex_count + 1
+		elif ("DHLGLOBALMAIL" in gaylord) or ("DHLGLOBALMAILV4" in gaylord):
+			dhl_count = dhl_count + 1
+	master_metadata["USPSCount"] = usps_count
+	master_metadata["DHLCount"] = dhl_count
+	master_metadata["FEDEXCount"] = fedex_count
+	master_metadata["gaylordCount"] = (usps_count + dhl_count + fedex_count)
+
+## Paperwork functions
+
+def createDetailedReport():
+	# The report used by Tri-Ad/us to figure out what packages belong to what gaylord/shipping information
+	global master_ACE_data
+	global master_metadata
+	file_name = master_metadata["date"] + os.sep + master_metadata["date"] + "-Detailed_Report.csv"
+	try:
+		with open(file_name, "w", newline = "") as report_file:
+			csv_writer = csv.writer(report_file)
+			csv_writer.writerow(["Gaylord", "Name", "Address", "City", "State", "Country", "ZIP", "BATCHID", "ORDERID", "SCAC", "Service", "Client", "Close Date", "Commodity 1", "Commodity 2", "Commodity 3", "Commodity 4", "Commodity 5", "Commodity 6", "Commodity 7", "Commodity 8", "Commodity 9", "Commodity 10"])
+			for entry in master_ACE_data:
+				#Ugly csv line building. Please ignore
+				out_line = [entry["GAYLORD"], entry["consignee"]["name"], entry["consignee"]["address"]["addressLine"], entry["consignee"]["address"]["city"], _stateProvince, entry["consignee"]["address"]["country"], entry["consignee"]["address"]["postalCode"], entry["BATCHID"], entry["ORDERID"], entry["shipmentControlNumber"], entry["carrier"], entry["client"], entry["closeDate"]]
+				for commodity in entry["commodities"]:
+					out_line.append(commodity["description"])
+				csv_writer.writerow(out_line)
+	except: errorBox("Error printing Detailed Report.\nFile open in another program?")
+
+def createBoL():
+	#Loads a .jpg file template, then writes the last few details to the image before saving it as a .pdf
+	global master_metadata
+	file_name =  master_metadata["date"] + os.sep + master_metadata["date"] + "-Stalco-BoL.pdf"
+	image_file_path = "resources/STALCO_BOL.jpg"
+	c = canvas.Canvas(file_name, pagesize = (1668, 1986), bottomup = 0)
+	image = ImageReader(image_file_path)
+	c.drawImage(image, 0, 0, mask = "auto")
+
+	c.setFont("Courier", 24)
+	c.drawString(4, 340, app.getEntry("Date:"))
+	c.drawString(1555, 330, master_metadata["BoL"])
+	c.drawString(1562, 355, master_metadata["PAPS"])
+	c.drawString(134, 1210, str(master_metadata["gaylordCount"]))
+	c.drawString(176, 1310, str(master_metadata["USPSCount"]))
+	c.drawString(171, 1360, str(master_metadata["DHLCount"]))
+	c.drawString(181, 1410, str(master_metadata["FEDEXCount"]))
+	c.drawString(525, 1175, str(master_metadata["packageCount"]))
+	c.drawString(854, 1175, str(master_metadata["totalWeight"]))
+
+	c.showPage()
+	c.save()
+
+def createIMSBoL():
+	#Creates the BoL we send to IMS in the same method as the regular BoL
+	global master_metadata
+	global master_ACE_data
+
+	#Counts how many gaylords are headed to IMS
+	fedex_gaylords = []
+	fedex_count = 0
+	dhl_gaylords = []
+	dhl_count = 0
+	for gaylord in master_metadata["gaylordsAssignments"]:
+		if "FEDEX" in gaylord:
+			fedex_gaylords.append(gaylord[0])
+			fedex_count = fedex_count + 1
+		elif "DHLGLOBALMAIL" in gaylord or "DHLGLOBALMAILV4" in gaylord:
+			dhl_gaylords.append(gaylord[0])
+			dhl_count = dhl_count + 1
+	#Fedex Package Count for emails to Jen @ FedEx
+	master_metadata["fedex_package_count"] = 0
+	for entry in master_ACE_data:
+		if entry["carrier"] == "FEDEX":
+			master_metadata["fedex_package_count"] += 1
+	
+	file_name = master_metadata["date"] + os.sep + master_metadata["date"] + "-IMS-BoL.pdf"
+	image_file_path = "resources/IMS_BOL.jpg"
+	c = canvas.Canvas(file_name, pagesize = (1668, 1986), bottomup = 0)
+	image = ImageReader(image_file_path)
+	c.drawImage(image, 0, 0, mask = "auto")
+
+	c.setFont("Courier", 36)
+	c.drawString(1070, 184, master_metadata["date"])
+	c.drawString(1145, 760, str(fedex_count + dhl_count))
+	c.drawString(240, 1463, str(fedex_count) + " pkgs: " + str(master_metadata["fedex_package_count"]))
+	c.drawString(705, 1463, str(dhl_count))
+
+	#Writes a list of FedEx gaylords to the sheet in the proper area
+	for i, g in enumerate(fedex_gaylords):
+		c.drawString(16, 1508 + (i * 36), g)
+	#Same for DHL
+	for i, g in enumerate(dhl_gaylords):
+		c.drawString(520, 1508 + (i * 36), g)
+
+	c.showPage()
+	c.save()
+
+def createProForma():
+	#Creates the template we upload to SmartBorder
+	#Everything is hard-coded to meet their upload schema. Sorry. 
+	global master_ACE_data
+	global master_metadata
+	try:
+		if master_ACE_data == []: raise Exception
 		else: #If loading didn't error out
-			print("Building commodities list")
 			commodities_list = {}
-			for entry in detailed_report_json:
+			for entry in master_ACE_data:
 				for commodity in entry["commodities"]:
 					name = commodity["description"]
 					if name not in commodities_list.keys():
@@ -52,40 +557,39 @@ def createProForma():
 			#Techship passes bad data. Error Correction below
 			commodities_list = cleanCommoditiesList(commodities_list)
 
-			print("Loading ProForma information")
-			master_data = []
-			with open(os.getcwd() + os.sep + "resources" + os.sep + "MASTER_FDA_LIST.csv", "r") as master_file:
-				csv_reader = csv.reader(master_file, delimiter = ",")
-				for line in csv_reader:
-					if line != "" and line[0] != "#":
-						master_data.append(line)
+			fda_list = []
+			try:
+				with open("resources/MASTER_FDA_LIST.csv", "r") as master_file:
+					csv_reader = csv.reader(master_file, delimiter = ",")
+					for line in csv_reader:
+						if line != "":
+							fda_list.append(line)
+			except: errorBox("Error loading MASTER_FDA_LIST.csv. File open in another program?")
 
-			print("Matching commodities to Master File")
 			proforma_data = []
 			for commodity in commodities_list:
-				for line in master_data:
-					if commodity.upper() == line[2].upper() and commodities_list[commodity] != 0: #If commodity description matches description from Master FDA file and there is >0 items
+				for line in fda_list:
+					if cleanString(commodity).upper() == cleanString(line[2]).upper() and commodities_list[commodity] != 0: #If commodity description matches description from Master FDA file and there is >0 items
 						_quantity = commodities_list[commodity]
 						#Ugly CSV line building
 						_out = (line[1], _quantity, "PCS", float(line[5]), "", "", "", line[9], line[10], "", line[12], float(_quantity * float(line[5])), "", line[15], line[16], line[17], line[18], line[19], line[20], line[21], line[22], "", line[24], line[25], line[26], line[27], line[28], line[29], line[30], line[31], "", line[33], line[34], line[35], line[36], line[37], line[38], line[39], line[40], "", line[41], float(_quantity * float(line[5])), 1, "KG")
 						proforma_data.append(_out)
-
-			print("Saving ProForma upload template")
+			#More ugly
 			header = (("ShipperRefNum","PostToBroker","InvoiceDate","StateDest","PortEntry","MasterBillofLading","Carrier","EstDateTimeArrival","TermsofSale","RelatedParties","ModeTrans","ExportReason","FreightToBorder","ContactInformation","IncludesDuty","IncludesFreight","FreightAmount","IncludesBrokerage","Currency","TotalGrossWeightKG","ContainerNumber","ShippingQuantity","ShippingUOM","DutyandFeesBilledTo","InvoiceNumber","OwnerOfGoods","PurchaseOrder","ShipperCustNo","ShipperName","ShipperTaxID","ShipperAddr1","ShipperAddr2","ShipperCity","ShipperState","ShipperCountry","ShipperPostalCode","ShipperMfgID","ShipToCustNo","ShipToName","ShipToTaxID","ShipToAddr1","ShipToAddr2","ShipToCity","ShipToState","ShipToCountry","ShipToPostalCode","SellerCustNo","SellerName","SellerTaxID","SellerAddr1","SellerAddr2","SellerCity","SellerState","SellerCountry","SellerPostalCode","MfgCustNo","MfgName","MfgID","MfgAddress1","MfgAddress2","MfgCity","MfgState","MfgCountry","MfgPostalCode","BuyerCustNo","BuyerName","BuyerUSTaxID","BuyerAddress1","BuyerAddress2","BuyerCity","BuyerState","BuyerCountry","BuyerPostalCode","ConsigneeCustNo","ConsigneeName","ConsigneeUSTaxID","ConsigneeAddress1","ConsigneeAddress2","ConsigneeCity","ConsigneeState","ConsigneeCountry","ConsigneePostalCode","PartNumber","Quantity","QuantityUOM","UnitPrice","GrossWeightKG","NumberOfPackages","PackageUOM","CountryOrigin","SPI","ProductClaimCode","Description","ValueOfGoods","LineMfgCustNo","LineMfgName","LineMfgID","LineMfgAddress1","LineMfgAddress2","LineMfgCity","LineMfgState","LineMfgCountry","LineMfgPostalCode","LineBuyerCustNo","LineBuyerName","LineBuyerUSTaxID","LineBuyerAddress1","LineBuyerAddress2","LineBuyerCity","LineBuyerState","LineBuyerCountry","LineBuyerPostalCode","LineConsigneeCustNo","LineConsigneeName","LineConsigneeUSTaxID","LineConsigneeAddress1","LineConsigneeAddress2","LineConsigneeCity","LineConsigneeState","LineConsigneeCountry","LineConsigneePostalCode","LineNote","Tariff1Number","Tariff1ProductValue","Tariff1Quantity1","Tariff1Quantity1UOM","Tariff1Quantity2","Tariff1Quantity2UOM","Tariff1Quantity3","Tariff1Quantity3UOM","Tariff2Number","Tariff2ProductValue","Tariff2Quantity1","Tariff2Quantity1UOM","Tariff2Quantity2","Tariff2Quantity2UOM","Tariff2Quantity3","Tariff2Quantity3UOM","Tariff3Number","Tariff3ProductValue","Tariff3Quantity1","Tariff3Quantity1UOM","Tariff3Quantity2","Tariff3Quantity2UOM","Tariff3Quantity3","Tariff3Quantity3UOM","Tariff4Number","Tariff4ProductValue","Tariff4Quantity1","Tariff4Quantity1UOM","Tariff4Quantity2","Tariff4Quantity2UOM","Tariff4Quantity3","Tariff4Quantity3UOM","Tariff5Number","Tariff5ProductValue","Tariff5Quantity1","Tariff5Quantity1UOM","Tariff5Quantity2","Tariff5Quantity2UOM","Tariff5Quantity3","Tariff5Quantity3UOM","Tariff6Number","Tariff6ProductValue","Tariff6Quantity1","Tariff6Quantity1UOM","Tariff6Quantity2","Tariff6Quantity2UOM","Tariff6Quantity3","Tariff6Quantity3UOM"))
-			first_line = (app.getEntry("BoL #:"),"FALSE",app.getEntry("Date:"),"NY","0901",app.getEntry("PAPS #:"),app.getEntry("SCAC:"),app.getEntry("Date:") + " 03:00 PM","PLANT","","30","","","","","","","","",int(app.getEntry("Total Weight:")),"",app.getEntry("Package Count:"),"PCS","Buyer","","","","","STALCO INC","160901-55044","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","XOSTAINC401NOR","","","","","","","","","","","STALCO INC","160901-55044","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","","STALCO INC","XOSTAINC401NOR","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","","IMS OF WESTERN NY","16-131314301","2540 WALDEN AVE","SUITE 450","BUFFALO","NY","US","14225","","IMS OF WESTERN NY","16-131314301","2540 WALDEN AVE","SUITE 450","BUFFALO","NY","US","14225")
+			first_line = (master_metadata["BoL"], "FALSE", master_metadata["date"], "NY", "0901", master_metadata["PAPS"], master_metadata["SCAC"], master_metadata["date"] + " 03:00 PM","PLANT","","30","","","","","","","","",int(master_metadata["totalWeight"]),"",master_metadata["packageCount"],"PCS","Buyer","","","","","STALCO INC","160901-55044","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","XOSTAINC401NOR","","","","","","","","","","","STALCO INC","160901-55044","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","","STALCO INC","XOSTAINC401NOR","401 CLAYSON RD","","NORTH YORK","ON","CA","M9M 2H4","","IMS OF WESTERN NY","16-131314301","2540 WALDEN AVE","SUITE 450","BUFFALO","NY","US","14225","","IMS OF WESTERN NY","16-131314301","2540 WALDEN AVE","SUITE 450","BUFFALO","NY","US","14225")
 			
-			workbook = Workbook()
-			outputFolder()
-			filename = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-ProForma_Template.xlsx"
+			#Outputs the excel file for SmartBorder upload
+			workbook = pyxl.Workbook()
+			filename = master_metadata["date"] + os.sep + master_metadata["date"] + "-ProForma_Template.xlsx"
 			worksheet = workbook.active
 			worksheet.title = "Sheet1"
 			worksheet.append(header)
 			for row in proforma_data:
 				worksheet.append(first_line + row)
 			workbook.save(filename)
-			print(">>Proforma template complete")
 
-			with open(os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-USGR_Data.csv", "w", newline = "") as USGR_file:
+			#Creates the USGR Data file which is used by USTM to make USGRs
+			with open(master_metadata["date"] + os.sep + master_metadata["date"] + "-USGR_Data.csv", "w", newline = "") as USGR_file:
 				csv_writer = csv.writer(USGR_file)
 				for row in proforma_data:
 					csv_writer.writerow(row)
@@ -93,476 +597,28 @@ def createProForma():
 	except:
 		errorBox("Error creating ProForma. Did you create the Master JSON yet?")
 
-def loadVariables():
-	#Loads /resources/DATA.json
-	#DATA.json can be used to keep track of what the latest BoL/PAPS number is
-	print("\n>Loading BoL/PAPS")
-	with open(os.getcwd() + os.sep + "resources" + os.sep + "DATA.json", "r") as variables_file:
-		global data
-		data = json.load(variables_file)
-		app.setEntry("Date:", data["date"])
-		app.setEntry("BoL #:", data["BoL"])
-		app.setEntry("PAPS #:", data["PAPS"])
-	print(">>Loading complete")
-
-def updateVariables():
-	print("\n>Updating date/BoL/PAPS to today's values")
-	app.setEntry("Date:", str(date.today()))
-	app.setEntry("BoL #:", str(int(app.getEntry("BoL #:")) + 1).zfill(7))
-	app.setEntry("PAPS #:", str(int(app.getEntry("PAPS #:")) + 1).zfill(6))
-	outputFolder()
-	print(">>Updating complete")
-
-def saveVariables():
-	print("\n>Saving current date/BoL/PAPS")
-	global data
-	data["date"] = app.getEntry("Date:")
-	data["BoL"] = app.getEntry("BoL #:")
-	data["PAPS"] = app.getEntry("PAPS #:")
-	with open(os.getcwd() + os.sep + "resources" + os.sep + "DATA.json", "w") as variables_file:
-		json.dump(data, variables_file, indent = 4)
-	outputFolder()
-	print(">>Saving complete")
-
-def cleanCommoditiesList(commodities_list):
-	#To add products, take the Description from the ACE Manifest
-	#No need to set quantities to 0 as the items aren't in the Master FDA file and can't be added to the ProForma
-	try:
-		commodities_list["Eye Renew 0.5 fl oz Skin Care"] += commodities_list["BDRx Kit"]
-	except:
-		pass
-	try:
-		commodities_list['Flawless Face 2 fl oz'] += commodities_list["BDRx Kit"]
-	except:
-		pass
-	try:
-		commodities_list['Instalift 0.5 fl oz'] += commodities_list["BDRx Kit"]
-	except:
-		pass
-	try:
-		commodities_list['Tevida 60 caps - US'] += commodities_list['Tevida ']
-	except:
-		pass
-	try:
-		commodities_list['Vascular X 60 caps - US'] += commodities_list['Vascular X']
-	except:
-		pass
-	#print("########################")
-	#print(commodities_list)
-	return commodities_list
-	
-def createBoL():
-	print("\n>Creating BoL")
-	updateGaylordCounts()
-	
-	file_name = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-Stalco-BoL.pdf"
-	image_file_path = os.getcwd() + os.sep + "resources" + os.sep + "STALCO_BOL.jpg"
-	c = canvas.Canvas(file_name, pagesize = (1668, 1986), bottomup = 0)
-	image = ImageReader(image_file_path)
-	c.drawImage(image, 0, 0, mask = "auto")
-
-	c.setFont("Courier", 24)
-	today = date.today()
-	c.drawString(4, 340, app.getEntry("Date:"))
-	c.drawString(1555, 330, app.getEntry("BoL #:"))
-	c.drawString(1562, 355, app.getEntry("PAPS #:"))
-	c.drawString(134, 1210, app.getEntry("Total Gaylord Count:"))
-	c.drawString(176, 1310, app.getEntry("USPS Gaylord Count:"))
-	c.drawString(171, 1360, app.getEntry("DHL Gaylord Count:"))
-	c.drawString(181, 1410, app.getEntry("FedEx Gaylord Count:"))
-	c.drawString(525, 1175, app.getEntry("Package Count:"))
-	c.drawString(854, 1175, app.getEntry("Total Weight:"))
-
-	c.showPage()
-	c.save()
-
-	print(">>BoL generation complete")
-
-def createACE():
-	error_file = open(os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-Error_File.txt", "w")
-	try:
-		print("\n>Creating ACE Manifest")
-		# Check if all the files are present and correct filetypes
-		if app.getEntry("batchesFileEntry") != "" and \
-		   app.getEntry("batchesFileEntry")[-4:] == ".csv" and \
-		   app.getEntry("ACEManifestFileEntry") != "" and \
-		   app.getEntry("ACEManifestFileEntry")[-5:] == ".json" and \
-		   app.getEntry("CSVReportFileEntry") != "" and \
-		   app.getEntry("CSVReportFileEntry")[-4:] == ".csv":
-
-				global master_json_data
-			
-				print("Loading batches scans")
-				batches_data = []
-				with open(app.getEntry("batchesFileEntry"), "r") as batches_file:
-					csv_reader = csv.reader(batches_file, delimiter = ",")
-					for line in csv_reader:
-						if line[0] != "" and line[1] != "" and "#" not in line[0] and "#" not in line[1]: #If the line isn't empty or a comment
-							batches_data.append([line[0], line[1]])
-
-				#NOTE: Currently if a client has FDA-regulated goods, none of their products can go through Section 321 (aka end up on the ACE)
-				#This may possibly change in the future
-				print("Loading FDA clients")
-				FDA_clients = []
-				with open(os.getcwd() + os.sep + "resources" + os.sep + "FDA_CLIENTS.json", "r") as clients_file:
-					json_data = json.load(clients_file)
-					for client in json_data["clients"]:
-						FDA_clients.append(client["name"])
-
-				#compare lists and build outputs
-				good_json = []
-				good_batches = []
-				global detailed_report_json
-				detailed_report_json = []
-				for json_entry in master_json_data:
-					for row in batches_data:
-						if json_entry["BATCHID"] == row[0] or json_entry["ORDERID"] == row[0]: #If there's a match
-							if json_entry["client"] in FDA_clients: #If the product is commercially cleared
-								json_entry["GAYLORD"] = row[1] #Append the Gaylord assignment to the entry
-								#good_json.append(json_entry) #Doesn't go on the JSON, only Detailed Report
-								detailed_report_json.append(json_entry)
-								good_batches.append(row[0])     
-							else: #If it's not commercially cleared
-								json_entry["GAYLORD"] = row[1]
-								good_json.append(json_entry)
-								detailed_report_json.append(json_entry)
-								good_batches.append(row[0])
-								
-				good_json = validate_json(good_json) #Validation time
-
-				print(">>ACE Manifest Complete")
-				with open(os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-ACE.json", "w") as good_json_file:
-					json.dump(good_json, good_json_file, indent = 4)
-
-				#Unmatched JSON entries
-				print("\n>Printing Unmatched JSON Entries")
-				print("If an order below is from today, it is likely a missing pick ticket that must be found and scanned")
-				error_file.write("\n>Printing Unmatched JSON Entries")
-				error_file.write("\nIf an order below is from today, it is likely a missing pick ticket that must be found and scanned")
-
-				unique_batches_list = []
-				for json_entry in master_json_data:
-					if json_entry not in detailed_report_json and json_entry["BATCHID"] not in unique_batches_list:
-						unique_batches_list.append(json_entry["BATCHID"])
-						print("Unmatched JSON Entry: {} {} {}".format(json_entry['BATCHID'].ljust(8, " "), json_entry['closeDate'].ljust(22, " "), json_entry["client"]))
-						error_file.write("\nUnmatched JSON Entry: {} {} {}".format(json_entry['BATCHID'].ljust(8, " "), json_entry['closeDate'].ljust(22, " "), json_entry["client"]))
-
-				#Unmatched Batch Scans
-				print("\n>Printing Unmatched Batches")
-				print("Use the Batches page in Techship to find out what manfiest these belong to, and include them in the ACE")
-				error_file.write("\n\n>Printing Unmatched Batches")
-				error_file.write("\nUse the Batches page in Techship to find out what manfiest these belong to, and include them in the ACE")
-				
-				for row in batches_data:
-					if row[0] not in good_batches:
-						print("Unmatched batch: {} {}".format(row[0].ljust(8, " "), row[1]))
-						error_file.write("\nUnmatched batch: {} {}".format(row[0].ljust(8, " "), row[1]))
-
-				#Package Count
-				package_count = len(detailed_report_json)
-				app.setEntry("Package Count:", str(package_count))
-				app.setEntry("Total Weight:", str(int(package_count // 2.20462)))
-
-				#Gaylords Assignment
-				unique_gaylords_list = []
-				global gaylords_assignments
-				gaylords_assignments = []
-				for entry in detailed_report_json:
-					#Clean it first
-					if len(entry["GAYLORD"]) == 2:
-						entry["GAYLORD"] = "G0" + entry["GAYLORD"][-1]
-					#Add it to the uniques list
-					match = False
-					for unique_gaylord in unique_gaylords_list:
-						if entry["GAYLORD"] == unique_gaylord["id"]:
-							match = True
-					if not match:
-						unique_gaylords_list.append({"id": entry["GAYLORD"], "hasFDA": False, "hasUSPS": False, "hasDHL": False, "hasFedex": False, "packages": 0})
-				
-
-				for entry in detailed_report_json:
-					for line in unique_gaylords_list:
-						if entry["GAYLORD"] == line["id"]: #Will match only one gaylord
-							#Now set flags
-							line["packages"] += 1
-							if entry["carrier"] == "DHLGLOBALMAIL" or entry["carrier"] == "DHLGLOBALMAILV4":
-								line["hasDHL"] = True
-							elif entry["carrier"] == "FEDEX":
-								line["hasFedex"] = True
-							elif entry["carrier"] == "EHUB":
-								line["hasUSPS"]= True
-							else:
-								errorBox("Package with Order ID {} found without carrier".format(entry["ORDERID"]))
-							if entry["client"] in FDA_clients:
-								line["hasFDA"] = True
-
-				for line in unique_gaylords_list:
-					out = []
-					out.append(line["id"])
-
-					carriers_count = 0
-					if line["hasUSPS"]: carriers_count += 1
-					if line["hasDHL"]: carriers_count += 1
-					if line["hasFedex"]: carriers_count += 1
-
-					if carriers_count != 1:
-						out.append("ERROR")
-						errorBox("Multiple carriers found for {}".format(line["id"]))
-					elif line["hasUSPS"]: out.append("EHUB")
-					elif line["hasDHL"]: out.append("DHLGLOBALMAIL")
-					elif line["hasFedex"]: out.append("FEDEX")
-
-					if line["hasFDA"]: out.append("FDA")
-					else: out.append("")
-
-					out.append(line["packages"])
-
-					gaylords_assignments.append(out)
-
-				gaylords_assignments.sort(key = lambda x: x[0])
-					
-				#Detailed Report
-				file_name = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-Detailed_Report.csv"
-				with open(file_name, "w", newline = "") as report_file:
-					csv_writer = csv.writer(report_file)
-					csv_writer.writerow(["Gaylord", "Name", "Address", "City", "State", "Country", "ZIP", "BATCHID", "ORDERID", "SCAC", "Service", "Client", "Close Date", "Commodity 1", "Commodity 2", "Commodity 3", "Commodity 4", "Commodity 5", "Commodity 6", "Commodity 7", "Commodity 8", "Commodity 9", "Commodity 10"])
-					for entry in detailed_report_json:
-						try:
-							_stateProvince = entry["consignee"]["address"]["stateProvince"]
-						except:
-							_stateProvince = ""
-						out_line = [entry["GAYLORD"], entry["consignee"]["name"], entry["consignee"]["address"]["addressLine"], entry["consignee"]["address"]["city"], _stateProvince, entry["consignee"]["address"]["country"], entry["consignee"]["address"]["postalCode"], entry["BATCHID"], entry["ORDERID"], entry["shipmentControlNumber"], entry["carrier"], entry["client"], entry["closeDate"]]
-						for commodity in entry["commodities"]:
-							out_line.append(commodity["description"])
-						csv_writer.writerow(out_line)
-
-				print(">>Orders validated and Detailed Report created")
-				print(f">>Outputting {package_count} entries to Detailed Report")
-				error_file.write(f"\n\n>>Outputting {package_count} entries to Detailed Report\n")
-		else:
-			raise FileNotFoundError
-	except FileNotFoundError:
-		if app.getEntry("batchesFileEntry") == "": errorBox("Batches Scans file not found!\nA copy should be located in W:\\Logistics\\Tools\\USTruckManager\\")
-		elif app.getEntry("batchesFileEntry")[-4:] != ".csv": errorBox("Batches Scans file not a CSV file")
-		if app.getEntry("ACEManifestFileEntry") == "": errorBox("ACE Manifest not found!")
-		elif app.getEntry("ACEManifestFileEntry")[-5:] != ".json": errorBox("ACE Manifest not a JSON file")
-		if app.getEntry("CSVReportFileEntry") == "": errorBox("CSV Report not found!")
-		elif app.getEntry("CSVReportFileEntry")[-4:] != ".csv": errorBox("CSV Report not a CSV file ! Did you download the XLSX (excel) version by accident?")
-	except Exception:
-		errorBox("Some other error occured")
-	finally:
-		try: error_file.close()
-		except: pass
-
-def outputFolder():
-	folder_path = os.getcwd() + os.sep + app.getEntry("Date:")
-	if not os.path.exists(folder_path):
-		os.mkdir(folder_path)
-		print("Creating folder for", app.getEntry("Date:"))
-
-def createMasterJSON():
-	#Opens the ACE and CSV report. Matches entries in the two based on order IDs. Takes the client/carrier/close date data from the CSV and adds it to the ACE
-	global master_json_data
-	print(">Creating Master JSON")
-	
-
-	report_list = []
-	print("Loading CSV Report")
-	try:
-		i = -1
-		with open(app.getEntry("CSVReportFileEntry"), "r", encoding='utf8') as report_file:
-			csv_reader = csv.reader(report_file, delimiter = ",")
-			for i, line in enumerate(csv_reader, start = 1): #Unused enumerate for error-handling
-				if line[0] != "#": #For testing
-					report_list.append(line)
-	except FileNotFoundError: errorBox("CSV Report not found!")
-	except: errorBox(f"Failed to load CSV Report on line {i}")
-				
-	print("Loading ACE")
-	ACE_data = []
-	master_json_data = []
-	try:
-		with open(app.getEntry("ACEManifestFileEntry"), "r") as ACE_file:
-			ACE_data = json.load(ACE_file)
-
-		print("Merging data (Please wait patiently!)")
-		for csv_entry in report_list:
-			for json_entry in ACE_data:
-				if csv_entry[16] == json_entry["ORDERID"]:
-					json_entry["client"] = csv_entry[1]
-					json_entry["carrier"] = csv_entry[2]
-					json_entry["closeDate"] = csv_entry[22] #UTC
-					#json_entry["trackingNumber"] = csv_entry[15] # Stored in scientific notation. WHYYYYYYY
-					master_json_data.append(json_entry)
-	except FileNotFoundError: errorBox("ACE Manifest not found!")
-	except: errorBox("Error loading ACE Manifest")
-	print(">>Master JSON Generated!")
-
-def clean(in_string):
-	good_chars = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ "
-	return "".join(c for c in in_string if c in good_chars)
-
-def validate_json(in_json):
-	out_json = []
-
-	SCAC_code = app.getEntry("SCAC:")
-
-	# Get rid of duplicates
-	for entry in in_json:
-
-		if entry["client"] == "LUS Brands" and "," in entry["GAYLORD"]:
-			#print(entry["ORDERID"], entry["GAYLORD"], entry["carrier"])
-			if entry["carrier"] == "EHUB":
-				entry["GAYLORD"] = entry["GAYLORD"].split(",")[0]
-			else:
-				entry["GAYLORD"] = "G" + entry["GAYLORD"].split(",")[1].replace("G", "")
-			#print(entry["GAYLORD"])
-		elif "," in entry["GAYLORD"]:
-			app.errorBox("ErrorBox", "WARNING! Non-LUS pick ticket assigned to multiple gaylords!")
-
-		entry["shipmentControlNumber"] = entry["shipmentControlNumber"].replace("TAIW", SCAC_code)
-		
-		#International Orders (shipped to IMS)
-		if entry["consignee"]["address"]["country"] != "US":
-			entry["consignee"]["address"]["addressLine"] = "2540 Walden Ave Suite 450"
-			entry["consignee"]["address"]["country"] = "US"
-			entry["consignee"]["address"]["city"] = "Buffalo"
-			entry["consignee"]["address"]["stateProvince"] = "NY"
-			entry["consignee"]["address"]["postalCode"] = "14225"
-		#Name
-		if len(entry["consignee"]["name"]) <= 2:
-			entry["consignee"]["name"] = entry["consignee"]["name"].ljust(3, "A")
-		elif len(entry["consignee"]["name"]) >= 60:
-			entry["consignee"]["name"] = entry["consignee"]["name"][:59]
-		#Address
-		if len(entry["consignee"]["address"]["addressLine"]) <= 2:
-			entry["consignee"]["address"]["addressLine"] = entry["consignee"]["address"]["addressLine"].ljust(3, "A")
-		elif len(entry["consignee"]["address"]["addressLine"]) >= 55:
-			entry["consignee"]["address"]["addressLine"] = entry["consignee"]["address"]["addressLine"][:54]
-		#City
-		if len(entry["consignee"]["address"]["city"]) <= 3:
-			entry["consignee"]["address"]["city"] = entry["consignee"]["address"]["city"].ljust(2, "A")
-		elif len(entry["consignee"]["address"]["city"]) >= 30:
-			entry["consignee"]["address"]["city"] = entry["consignee"]["address"]["city"][:29]
-		#State
-		states_list = ["AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS", "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY", "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV", "WI", "WY", "AS", "DC", "GU", "MP", "PR", "VI"]
-		if entry["consignee"]["address"]["stateProvince"] not in states_list:
-			entry["consignee"]["address"]["stateProvince"] = "NY"
-		#Zip
-		if len(entry["consignee"]["address"]["postalCode"]) != 5:
-			entry["consignee"]["address"]["postalCode"] = entry["consignee"]["address"]["postalCode"].rjust(5, "0")
-
-		#Clean non-alphanumeric Characters
-		entry["consignee"]["name"] = clean(entry["consignee"]["name"])
-		entry["consignee"]["address"]["addressLine"] = clean(entry["consignee"]["address"]["addressLine"])
-		entry["consignee"]["address"]["city"] = clean(entry["consignee"]["address"]["city"])
-
-		#Check for duplicates
-		if entry not in out_json:
-			out_json.append(entry)
-		else:
-			print(f"Duplicate entry removed: {entry['ORDERID']}")
-			#error_file.write(f"Duplicate entry removed: {entry['ORDERID']}")
-	return out_json
-
-def createIMSBoL():
-	print("\n>Creating IMS BoL")
-	updateGaylordCounts()
-	global gaylords_assignments
-	global detailed_report_json
-	if gaylords_assignments == [] or detailed_report_json == []:
-		errorBox(">ERROR: No gaylords found. Please generate ACE/Detailed Report first")
-	else: 
-		fedex_gaylords = []
-		fedex_count = 0
-		dhl_gaylords = []
-		dhl_count = 0
-		for gaylord in gaylords_assignments:
-			if "FEDEX" in gaylord:
-				fedex_gaylords.append(gaylord[0])
-				fedex_count = fedex_count + 1
-			elif ("DHLGLOBALMAIL" in gaylord) or ("DHLGLOBALMAILV4" in gaylord):
-				dhl_gaylords.append(gaylord[0])
-				dhl_count = dhl_count + 1
-
-		#Fedex Package Count
-		global fedex_package_count
-		fedex_package_count = 0
-		for entry in detailed_report_json:
-			if entry["carrier"] == "FEDEX":
-				fedex_package_count += 1
-	
-	file_name = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-IMS-BoL.pdf"
-	image_file_path = os.getcwd() + os.sep + "resources" + os.sep + "IMS_BOL.jpg"
-	c = canvas.Canvas(file_name, pagesize = (1668, 1986), bottomup = 0)
-	image = ImageReader(image_file_path)
-	c.drawImage(image, 0, 0, mask = "auto")
-
-	c.setFont("Courier", 36)
-	c.drawString(1070, 184, app.getEntry("Date:"))
-	c.drawString(1145, 760, str(fedex_count + dhl_count))
-	c.drawString(240, 1463, str(fedex_count) + " pkgs: " + str(fedex_package_count))
-	c.drawString(705, 1463, str(dhl_count))
-
-	for i, g in enumerate(fedex_gaylords):
-		c.drawString(16, 1508 + (i * 36), g)
-
-	for i, g in enumerate(dhl_gaylords):
-		c.drawString(520, 1508 + (i * 36), g)
-
-	c.showPage()
-	c.save()
-
-	print(">>IMS BoL created")
-
-def updateGaylordCounts():
-	##Gaylord counts
-		usps_count = 0
-		dhl_count = 0
-		fedex_count = 0
-		global gaylords_assignments
-		if gaylords_assignments == []:
-			errorBox(">ERROR: No gaylords found. Please generate ACE/Detailed Report first")
-		else:
-			for gaylord in gaylords_assignments:
-				if "EHUB" in gaylord:
-					usps_count = usps_count + 1
-				elif "FEDEX" in gaylord:
-					fedex_count = fedex_count + 1
-				elif ("DHLGLOBALMAIL" in gaylord) or ("DHLGLOBALMAILV4" in gaylord):
-					dhl_count = dhl_count + 1
-			app.setEntry("USPS Gaylord Count:", str(usps_count))
-			app.setEntry("DHL Gaylord Count:", str(dhl_count))
-			app.setEntry("FedEx Gaylord Count:", str(fedex_count))
-			app.setEntry("Total Gaylord Count:", str(usps_count + dhl_count + fedex_count))
-
 def createLoadSheet():
+	#Creates a useful but non-essential sheet detailing each gaylord, where its going, if it has FDA products, and how many packages it holds
+	global master_metadata
 	try:
-		print("\n>Creating Load Sheet")
-		updateGaylordCounts()
-		global gaylords_assignments
-		if gaylords_assignments == []:
-			print("/n>ERROR: No gaylords found. Please generate ACE/Detailed Report first")
-
 		#Write to file
-		file_name = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:") + "-Load_Sheet.pdf"
+		file_name = master_metadata["date"] + os.sep + master_metadata["date"] + "-Load_Sheet.pdf"
 		c = canvas.Canvas(file_name, pagesize = (595.27, 841.89), bottomup = 0)
 		c.setFont("Courier", 12)
 		c.drawString(10, 22, app.getEntry("Date:") + " Load Sheet")
 		c.drawString(10, 50, "SKID CARRIER       FDA? PACKAGES")
-		for i, row in enumerate(gaylords_assignments, start = 3):
+		for i, row in enumerate(master_metadata["gaylordsAssignments"], start = 3):
 			c.drawString(10, (22 + i * 14), (row[0].ljust(5, " ") + row[1].ljust(14, " ") + row[2].ljust(5, " ") + str(row[3])))
 		c.showPage()
 		c.save()
-		print(">>Load Sheet generation complete")
 	except Exception:
 		traceback.print_exc()
 
 def emailPaperwork():
 	#Check if all files exist
-	print("\n>Attempting to Send Email")
+	global master_metadata
 	
-	folder = os.getcwd() + os.sep + app.getEntry("Date:") + os.sep + app.getEntry("Date:")
+	folder = master_metadata["date"] + os.sep + master_metadata["date"]
 	if os.path.exists(folder + "-ACE.json") and \
 	   os.path.exists(folder + "-Detailed_Report.csv") and \
 	   os.path.exists(folder + "-IMS-BoL.pdf") and \
@@ -580,9 +636,9 @@ def emailPaperwork():
 			files.append(folder + "-Stalco-BoL.pdf")
 			files.append(app.getEntry("ProFormaFileEntry"))
 			
-			# EMAIL
-			global data
-			username = app.stringBox("Username?", "Please enter your Outlook email address:", parent = None)
+			#Make email
+			global config_data
+			username = app.stringBox("Username?", "Please enter your Outlook email address:", parent = None) #Not saved on purpose for security reasons
 			password = app.stringBox("Password?", "Please enter the password for {}:".format(username), parent = None)
 			
 			smtp = smtplib.SMTP(host='smtp-mail.outlook.com', port=587)
@@ -590,21 +646,20 @@ def emailPaperwork():
 			smtp.login(username, password)
 
 			message = MIMEMultipart()
-			message_text = (app.getTextArea("EmailTextArea")  + "\n" \
+			message_text = (config_data["default_email_message"]  + "\n" \
 						   + app.getEntry("Total Gaylord Count:") + " Gaylords total:\n"
 						   + app.getEntry("USPS Gaylord Count:") + " for USPS, " + app.getEntry("DHL Gaylord Count:") + " for DHL, " + app.getEntry("FedEx Gaylord Count:") + " for FedEx\n"
 						   "Please hit \"REPLY ALL\" when responding to this email trail.")
 			
 			message["From"] = username
 			recipients = []
-			for recipient in data["emailRecipients"]:
+			for recipient in config_data["emailRecipients"]:
 				recipients.append(recipient["emailAddress"])
 			message["To"] = ", ".join(recipients)
-			#message["To"] = "james@stalco.ca"
-			#message["Subject"] = "SAMPLE EMAIL > Stalco > Buffalo Run > " + app.getEntry("Date:")
 			message["Subject"] = "Stalco > Buffalo Run > " + app.getEntry("Date:")
 			message.attach(MIMEText(message_text, "plain"))
 
+			#Attach files to email
 			for path in files:
 				part = MIMEBase('application', "octet-stream")
 				with open(path, 'rb') as file:
@@ -618,18 +673,14 @@ def emailPaperwork():
 			smtp.quit()
 
 			emailFedex(username, password)
-
-			print(">>Email sent successfully")
 		except:
-			print(">>Email failed!")
-			traceback.print_exc()
+			errorBox("Email failed!")
 	else:
-		print(">>Not all files created that are required for emailing")
+		errorBox("Not all files required for email are present! Make sure all the boxes are filled")
 
 def emailFedex(username, password):
 	if fedex_package_count != 0:
 		try:
-			print("\n>FedEx packages found. Emailing FedEx")
 			smtp = smtplib.SMTP(host='smtp-mail.outlook.com', port=587)
 			smtp.starttls()
 			smtp.login(username, password)
@@ -646,339 +697,370 @@ def emailFedex(username, password):
 			smtp.send_message(message)
 			del message
 			smtp.quit()
-			print(">>FedEx Email Sent")
 		except:
 			errorBox("Error sending FedEx email")
 
-def loadACEManifest():
+def copyPaperwork():
+	#Copies everything to the W: drive
+	global master_metadata
 	try:
-		global ACE_data
-		filename = app.getEntry("ACEManifestFileEntry2")
-		with open(filename, "r") as ACE_file:
-			#print(filename)
-			#print(ACE_file)
-			ACE_data = json.load(ACE_file)
-			app.setLabel("ACEStatusLabel", "{} ACE Entries Loaded".format(str(len(ACE_data))))
-			SCN_ending = ACE_data[0]["shipmentControlNumber"][-2:]
-			app.setLabel("SCNLabel", "SCNs currently end with: {}".format(SCN_ending))
-	except FileNotFoundError: errorBox("No file entered")
-	except: errorBox("Uploaded file was not an ACE Manfiest")
+		date = master_metadata["date"]
+		src = os.getcwd() + os.sep + date
+		year = date.split("-")[0]
+		month = date.split("-")[1]
+		dst = "W:/Logistics/USPS Customs/USPS Customs Paperwork/IMS Invoices - Mixed Shipments/{year}/{month}/{date}".format(year = year, month = month, date = date)
+		if not os.path.exists(dst):
+			os.mkdir(dst)
+		copyTree(src, dst)
+	except:
+		errorBox("Copying files failed!")
 
-def loadACEEntry():
+## Main-Page Support Functions
+
+def loadVariables():
+	#CONFIG.json is used to keep track of what the latest BoL/PAPS number is
 	try:
-		global ACE_data
-		match = False
-		for entry in ACE_data:
-			if entry["shipmentControlNumber"] == app.getEntry("SCN #:"):
-				match = True
-				app.setEntry("ORDERID:", entry["ORDERID"])
-				app.setEntry("BATCHID:", entry["BATCHID"])
-				app.setEntry("NAME:", entry["consignee"]["name"])
-				app.setEntry("ADDRESS:", entry["consignee"]["address"]["addressLine"])
-				app.setEntry("COUNTRY:", entry["consignee"]["address"]["country"])
-				app.setEntry("CITY:", entry["consignee"]["address"]["city"])
-				app.setEntry("STATE:", entry["consignee"]["address"]["stateProvince"])
-				app.setEntry("POSTALCODE:", entry["consignee"]["address"]["postalCode"])
-				try: app.setEntry("GAYLORD:", entry["GAYLORD"])
-				except: pass
-		if not match: raise Exception
-	except: errorBox("SCAC does not correspond to an entry in this ACE")
-	
-def saveACEManifest():
-	global ACE_data
-	for entry in ACE_data:
-		if entry["shipmentControlNumber"] == app.getEntry("SCN #:"):
-			entry["ORDERID"] = app.getEntry("ORDERID:")
-			entry["BATCHID"] = app.getEntry("BATCHID:")
-			entry["consignee"]["name"] = app.getEntry("NAME:")
-			entry["consignee"]["address"]["addressLine"] = app.getEntry("ADDRESS:")
-			entry["consignee"]["address"]["country"] = app.getEntry("COUNTRY:")
-			entry["consignee"]["address"]["city"] = app.getEntry("CITY:")
-			entry["consignee"]["address"]["stateProvince"] = app.getEntry("STATE:")
-			entry["consignee"]["address"]["postalCode"] = app.getEntry("POSTALCODE:")
-			if app.getEntry("GAYLORD:") != "":
-				try: entry["GAYLORD"] = app.getEntry("GAYLORD:")
-				except: pass
-	with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
-		json.dump(ACE_data, ACE_file, indent = 4)
+		with open("resources/CONFIG.json", "r") as variables_file:
+			global config_data
+			config_data = json.load(variables_file)
+			config_data["date"] = date.today()
+			app.setEntry("Date:", config_data["date"])
+			app.setEntry("BoL #:", config_data["BoL"])
+			app.setEntry("PAPS #:", config_data["PAPS"])
+			app.setEntry("USGR Date:", config_data["date"])
+			app.setEntry("File Date:", app.getEntry("Date:"))
+			app.setTextArea("EmailTextArea", config_data["default_email_message"])
+	except:
+		errorBox("Error loading /resources/CONFIG.json.\nFile missing/open in another program?")
+
+def increaseVariables():
+	#Sets date to today and advances BoL and PAPS number by 1
+	global config_data
+	config_data["date"] = str(date.today())
+	app.setEntry("Date:", config_data["date"])
+
+	config_data["BoL"] = str(int(config_data["BoL"]) + 1).zfill(7)
+	app.setEntry("BoL #:", config_data["BoL"])
+
+	config_data["PAPS"] = str(int(config_data["PAPS"]) + 1).zfill(6)
+	app.setEntry("PAPS #:", config_data["PAPS"])
+
+def decreaseVariables():
+	global config_data
+	config_data["date"] = str(date.today())
+	app.setEntry("Date:", config_data["date"])
+
+	config_data["BoL"] = str(int(config_data["BoL"]) - 1).zfill(7)
+	app.setEntry("BoL #:", config_data["BoL"])
+
+	config_data["PAPS"] = str(int(config_data["PAPS"]) - 1).zfill(6)
+	app.setEntry("PAPS #:", config_data["PAPS"])
+
+def saveVariables():
+	global config_data
+	with open("resources/CONFIG.json", "w") as variables_file:
+		json.dump(config_data, variables_file, indent = 4)
+
+## Page 2 Functions
+
+def loadACEManifest():
+	#Loads the ACE so the rest of the features can use the data
+	#Also says how many packages are on the ACE as a "green light"
+	if app.getEntry("File Date:") == "":
+		errorBox("Please enter in the date for this ACE")
+	else:
+		try:
+			global ACE_data
+			with open(app.getEntry("ACEManifestFileEntry2"), "r") as ACE_file:
+				ACE_data = json.load(ACE_file)
+				app.setLabel("ACEStatusLabel", "{} ACE Entries Loaded".format(str(len(ACE_data))))
+				SCN_ending = ACE_data[0]["shipmentControlNumber"][-2:]
+				app.setLabel("SCNLabel", "SCNs currently end with: {}".format(SCN_ending))
+		except FileNotFoundError: errorBox("No file entered")
+		except: errorBox("Uploaded file was not an ACE Manfiest")
 
 def removeGaylord():
-	global ACE_data
-	gaylord = app.getEntry('Gaylord (eg. "G1"):')
-	good_entries = []
-	bad_entries = []
+	#Removes a specific gaylord from the ACE, then prints
 	try:
-		for entry in ACE_data:
-			if entry["GAYLORD"] != gaylord:
-				good_entries.append(entry)
-			else:
-				bad_entries.append(entry)
+		global ACE_data
+		gaylord = app.getEntry('Gaylord (eg. "G1"):').upper()
+		good_entries = []
+		bad_entries = []
+		try:
+			for entry in ACE_data:
+				if entry["GAYLORD"] != gaylord:
+					good_entries.append(entry)
+				else:
+					bad_entries.append(entry)
+		except:
+			errorBox("No enties for Gaylord {}".format(gaylord))
+		print(f"{str(len(bad_entries))} entries removed from {gaylord}")
+		ACE_data = good_entries
+		with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
+			json.dump(ACE_data, ACE_file, indent = 4)
+		with open(app.getEntry("ACEManifestFileEntry2") + "-REMOVED_GAYLORDS", "w") as ACE_file:
+			json.dump(bad_entries, ACE_file, indent = 4)
+		app.infoBox("Done", "Gaylord {} successfully removed".format(gaylord))
+		app.setLabel("ACEStatusLabel", "{} ACE Entries Loaded".format(str(len(ACE_data))))
 	except:
-		errorBox("No enties for for Gaylord {}".format(gaylord))
-	print(f"{str(len(bad_entries))} entries removed for {gaylord}")
-	ACE_data = good_entries
-	with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
-		json.dump(ACE_data, ACE_file, indent = 4)
-	with open(app.getEntry("ACEManifestFileEntry2") + "-REMOVED_ENTRIES", "w") as ACE_file:
-		json.dump(bad_entries, ACE_file, indent = 4)
-			
-def doEverything():
-	createMasterJSON()
-	createACE()
-	createProForma()
-	createLoadSheet()
-	createBoL()
-	createIMSBoL()
+		errorBox("Error removing Gaylord {}. Please check gaylord and if ACE was loaded".format(gaylord))
 
-def errorBox(input_string):
-	app.errorBox("ErrorBox", input_string)
-	try: traceback.print_exc()
-	except: pass
-
-def debug(in_string):
-	global debug_flag
-	if debug_flag:
-		print(in_string)
-
-def convertJSONToCSV():
-    #Process JSON file
-    print("\n>Converting JSON file to CSV")
-    with open(app.getEntry("JSON")) as json_file:
-        data = json.load(json_file)
-    data_file = open("ACE_Manifest_(CSV).csv", "w", newline="")
-    csv_writer = csv.writer(data_file)
-
-    for l in data: #for line in data:
-        #try:
-        ''' 2020-11-26 Problem with Province Of Loading. Hardcoding for the time being
-        #DHL Manifests don't have Province of Loading T.T
-        try:
-            _province_of_loading = l["provinceOfLoading"],
-        except:
-            _province_of_loading = "ON"
-        '''
-        try:
-            _consignee_province = l["consignee"]["address"]["stateProvince"]
-            _consignee_postal_code = l["consignee"]["address"]["postalCode"]
-        except:
-            _consignee_province = ""
-        try:
-            _shipper_name = l["shipper"]["name"]
-            _shipper_address = l["shipper"]["address"]["addressLine"]
-            _shipper_country = l["shipper"]["address"]["country"]
-            _shipper_city = l["shipper"]["address"]["city"]
-            _shipper_province = l["shipper"]["address"]["stateProvince"]
-            _shipper_postal_code = l["shipper"]["address"]["postalCode"]
-        except:
-            _shipper_name = "Stalco Inc."
-            _shipper_address = "401 Clayson Road"
-            _shipper_country =  "CA"
-            _shipper_city = "Toronto"
-            _shipper_province = "ON"
-            _shipper_postal_code = "M9M2H4"
-        
-        head = ( #Doing it manually for now. This format doesn't change often
-            l["ORDERID"],
-            l["BATCHID"],
-            l["data"],
-            l["type"],
-            l["shipmentControlNumber"],
-            # Defaults for when ACE is missing entries
-            #_province_of_loading,
-            "ON", #2020-11-26 hardcoding Temporarily
-            _shipper_name,
-            _shipper_address,
-            _shipper_country,
-            _shipper_city,
-            _shipper_province,
-            _shipper_postal_code,
-            l["consignee"]["name"],
-            l["consignee"]["address"]["addressLine"],
-            l["consignee"]["address"]["country"],
-            l["consignee"]["address"]["city"],
-            _consignee_province,
-            _consignee_postal_code
-        )
-        for i, commodity in enumerate(l["commodities"]): #for commodity in line["commodities"]
-            body = (
-                l["commodities"][i]["description"],
-                l["commodities"][i]["quantity"],
-                l["commodities"][i]["packagingUnit"],
-                l["commodities"][i]["weight"],
-                l["commodities"][i]["weightUnit"]
-            )
-            #if l["commodities"][i]["value"] != "":
-            if "value" in l["commodities"][i].keys():
-                body = body + (l["commodities"][i]["value"],)
-            if "countryOfOrigin" in l["commodities"][i]:
-                body = body + (l["commodities"][i]["countryOfOrigin"],)
-            row = head + body
-            csv_writer.writerow(row)
-        #except:
-            #print("Error on order ID {}".format(l["ORDERID"],))
-    data_file.close()
-    print("Finished converting JSON")
-    print("Outputting to \"ACE_Manifest_(CSV).csv\"")
-
-def convertCSVToJSON():
-    print("\n>Converting CSV file to JSON")
-    with open(app.getEntry("CSV")) as csv_file:
-    #with open("C:\\Users\\Alex\\Desktop\\Alex's Workspace\\BatchRemover\\output.csv") as csv_file:
-        csv_reader = csv.reader(csv_file, delimiter = ',')
-        csv_data = []
-        for row in csv_reader:
-            csv_data.append(row)
-            
-        #Makes a list of consignees to add to JSON
-        consignees = []
-        for row in csv_data:
-            if row[4] not in consignees:
-                consignees.append(row[4])
-
-        #For each consignee, add each entry to JSON
-        out_json = []
-        for consignee in consignees:
-            #print("Building {}".format(consignee))
-            entry = {}
-            for row in csv_data:
-                if consignee == row[4]:
-                    #print("Match found for {}".format(consignee))
-                    entry = {
-                        "ORDERID": row[0],
-                        "BATCHID": row[1],
-                        "data": row[2],
-                        "type": row[3],
-                        "shipmentControlNumber": row[4],
-                        "provinceOfLoading": row[5],
-                        "shipper": {
-                            "name": row[6],
-                            "address": {
-                                "addressLine": row[7],
-                                "country": row[8],
-                                "city": row[9],
-                                "stateProvince": row[10],
-                                "postalCode": row[11].zfill(5)
-                            }
-                        },
-                        "consignee": {
-                            "name": row[12],
-                            "address": {
-                                "addressLine": row[13],
-                                "country": row[14],
-                                "city": row[15],
-                                "stateProvince": row[16],
-                                "postalCode": row[17].zfill(5)
-                            }
-                        },
-                        "commodities": []
-                    }
-
-            for row in csv_data: #Searches for commodities that match consignee
-                if consignee == row[4]:
-                    commodity = {}
-                    if len(row) == 25: #If the entry has value and countryOfOrigin
-                        commodity = {
-                            "description": row[18],
-                            "quantity": float(row[19]),
-                            "packagingUnit": row[20],
-                            "weight": int(row[21]),
-                            "weightUnit": row[22],
-                            "value": row[23],
-                            "countryOfOrigin": row[24]
-                        }
-                    elif len(row) == 24: #If it has only value
-                        commodity = {
-                            "description": row[18],
-                            "quantity": float(row[19]),
-                            "packagingUnit": row[20],
-                            "weight": int(row[21]),
-                            "weightUnit": row[22],
-                            "value": row[23],
-                        }
-                    else:
-                        commodity = {
-                            "description": row[18],
-                            "quantity": float(row[19]),
-                            "packagingUnit": row[20],
-                            "weight": int(row[21]),
-                            "weightUnit": row[22]
-                        }
-                    entry["commodities"].append(commodity)
-            out_json.append(entry)
-        with open("ACE_Manifest_(JSON).json", "w") as json_file:
-            json.dump(out_json, json_file, indent=4)
-        print(">Done converting CSV to JSON")
-        print("Outputting to \"ACE_Manifest_(JSON).json\"")
-    
-def removeOrders():
-    print("\n>Splitting ACE")
-    orders = app.getTextArea("ordersTextArea")
-    orders = orders.replace("\n", ",")
-    orders_list = orders.split(",")
-    
-    with open(app.getEntry("ACE")) as json_file:
-        json_data = json.load(json_file)
-        data = json_data.copy()
-
-    #Split out orders
-    split_orders = []
-    for entry in json_data:
-        #Match Transaction/Batch ID
-        for order in orders_list:
-            if entry["ORDERID"] == order or entry["BATCHID"] == order:
-                split_orders.append(entry)
-                data.remove(entry)
-                print("Removed order {} for {}".format(order, entry["consignee"]["name"]))
-    #Output
-    with open("ACE_Manifest_(1).json", "w") as json_file:
-            json.dump(data, json_file, indent = 4)
-    with open("ACE_Manifest_(2).json", "w") as bad_orders_file:
-            json.dump(split_orders, bad_orders_file, indent = 4)
-    print("Finished splitting ACE")
-    print("Outputting original ACE to \"ACE_Manifest_(1).json\"")
-    print("Outputting split entries to \"ACE_Manifest_(2).json\"")
-
-def jsonBeautifier():
-    print("\n>Formatting JSON")
-    json_file_name = app.getEntry("Ugly JSON")
-    with open(json_file_name, "r") as json_file:
-        json_data = json.load(json_file)
-    out_file_name = "ACE_Manifest_(Cleaned).json"
-    with open(out_file_name, "w") as json_file:
-        json.dump(json_data, json_file, indent = 4)
-    print("Done formatting JSON")
-    print("Outputting to \"ACE_Manifest_(Cleaned).json\"")
-
-def combineJSON():
-    print(">Combining JSONs")
-    out_data = []
-    with open(app.getEntry("JSON 1"), "r") as json_file_1:
-        json_data_1 = json.load(json_file_1)
-    with open(app.getEntry("JSON 2"), "r") as json_file_2:
-        json_data_2 = json.load(json_file_2)
-    for line in json_data_1:
-        out_data.append(line)
-    for line in json_data_2:
-        out_data.append(line)
-    with open("ACE_Manifest_(Combined).json", "w") as json_file:
-        json.dump(out_data, json_file, indent = 4)
-    print("Done combining JSONs")
-    print("Outputting to \"ACE_Manifest_(Combined).json\"")
+def removeItems():
+	#Removes any packages from the ACE that match the BATCHID/ORDERID as requested
+	try:
+		global ACE_data
+		batches = app.getTextArea('batchesTextArea').replace("\n", ",").split(",")
+		good_entries = []
+		bad_entries = []
+		for entry in ACE_data:
+			for line in batches:
+				if entry["BATCHID"] != line and entry["ORDERID"] != line:
+					good_entries.append(entry)
+				else:
+					bad_entries.append(entry)
+		ACE_data = good_entries
+		with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
+			json.dump(ACE_data, ACE_file, indent = 4)
+		with open(app.getEntry("ACEManifestFileEntry2") + "-REMOVED_ORDERS", "w") as ACE_file:
+			json.dump(bad_entries, ACE_file, indent = 4)
+		app.infoBox("Done", f"{str(len(bad_entries))} entries removed")
+		app.setLabel("ACEStatusLabel", "{} ACE Entries Loaded".format(str(len(ACE_data))))
+	except:
+		errorBox("Error removing specified batches/orders. Please check batches and if ACE was loaded")
 
 def changeSCNs():
-	new_SCN = app.getEntry("New 2 digits:")[:2]
-	for entry in ACE_data:
-		entry["shipmentControlNumber"] = entry["shipmentControlNumber"][:14] + new_SCN
-	with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
-		json.dump(ACE_data, ACE_file, indent = 4)
+	try:
+		new_SCN = app.getEntry("New 2 digits:")[:2]
+		for entry in ACE_data:
+			entry["shipmentControlNumber"] = entry["shipmentControlNumber"][:14] + new_SCN
+		with open(app.getEntry("ACEManifestFileEntry2"), "w") as ACE_file:
+			json.dump(ACE_data, ACE_file, indent = 4)
+			app.setLabel("SCNLabel", "SCNs currently end with: {}".format(new_SCN))
+		app.infoBox("Done", "SCN ending changed to {}".format(new_SCN))
+	except:
+		errorBox("Error changing SCN. Please check new SCN and if ACE was loaded")
+
+## Page 3 Functions
+
+def convertJSONToCSV():
+	#Process JSON file
+	try:
+		with open(app.getEntry("JSON")) as json_file:
+			data = json.load(json_file)
+			filepath = "ACE_Manifest_(CSV).csv"
+		data_file = open(filepath, "w", newline="")
+		csv_writer = csv.writer(data_file)
+
+		for l in data: #for line in data:
+			try:
+				_consignee_province = l["consignee"]["address"]["stateProvince"]
+				_consignee_postal_code = l["consignee"]["address"]["postalCode"]
+			except:
+				_consignee_province = ""
+			try:
+				_shipper_name = l["shipper"]["name"]
+				_shipper_address = l["shipper"]["address"]["addressLine"]
+				_shipper_country = l["shipper"]["address"]["country"]
+				_shipper_city = l["shipper"]["address"]["city"]
+				_shipper_province = l["shipper"]["address"]["stateProvince"]
+				_shipper_postal_code = l["shipper"]["address"]["postalCode"]
+			except:
+				_shipper_name = "Stalco Inc."
+				_shipper_address = "401 Clayson Road"
+				_shipper_country =  "CA"
+				_shipper_city = "Toronto"
+				_shipper_province = "ON"
+				_shipper_postal_code = "M9M2H4"
+			try:
+				_client = l["client"]
+				_carrier = l["carrier"]
+				_closeDate = l["closeDate"]
+				_trackingNumber = l["trackingNumber"]
+				_gaylord = l["GAYLORD"]
+			except:
+				_client = "N/A"
+				_carrier = "N/A"
+				_closeDate = "N/A"
+				_trackingNumber = "N/A"
+				_gaylord = "N/A"
+			
+			head = ( #Doing it manually for now. This format doesn't change often
+				l["ORDERID"],
+				l["BATCHID"],
+				l["data"],
+				l["type"],
+				l["shipmentControlNumber"],
+				# Defaults for when ACE is missing entries
+				#_province_of_loading,
+				"ON", #2020-11-26 hardcoding Temporarily
+				_shipper_name,
+				_shipper_address,
+				_shipper_country,
+				_shipper_city,
+				_shipper_province,
+				_shipper_postal_code,
+				l["consignee"]["name"],
+				l["consignee"]["address"]["addressLine"],
+				l["consignee"]["address"]["country"],
+				l["consignee"]["address"]["city"],
+				_consignee_province,
+				_consignee_postal_code,
+				_client,
+				_carrier,
+				_closeDate,
+				_trackingNumber,
+				_gaylord)
+			for i, commodity in enumerate(l["commodities"]): #for commodity in line["commodities"]
+				body = (
+					l["commodities"][i]["description"],
+					l["commodities"][i]["quantity"],
+					l["commodities"][i]["packagingUnit"],
+					l["commodities"][i]["weight"],
+					l["commodities"][i]["weightUnit"])
+				if "value" in l["commodities"][i].keys():
+					body = body + (l["commodities"][i]["value"],)
+				if "countryOfOrigin" in l["commodities"][i]:
+					body = body + (l["commodities"][i]["countryOfOrigin"],)
+				row = head + body
+				csv_writer.writerow(row)
+
+		data_file.close()
+		app.infoBox("Done", f"Finished converting JSON.\nOutputting to {filepath}")
+	except:
+		errorBox("Error converting JSON to CSV.\nPlease see console for more details")
+
+def convertCSVToJSON():
+	try:
+		with open(app.getEntry("CSV")) as csv_file:
+			csv_reader = csv.reader(csv_file, delimiter = ',')
+			csv_data = []
+			for row in csv_reader:
+				csv_data.append(row)
+				
+			#Makes a list of consignees to add to JSON
+			consignees = []
+			for row in csv_data:
+				if row[4] not in consignees:
+					consignees.append(row[4])
+
+			#For each consignee, add each entry to JSON
+			out_json = []
+			for consignee in consignees:
+				entry = {}
+				for row in csv_data:
+					if consignee == row[4]:
+						entry = {
+							"ORDERID": row[0], #I don't care if this is hard-coded. I'm the one who made the format of the CSV being read
+							"BATCHID": row[1],
+							"data": row[2],
+							"type": row[3],
+							"shipmentControlNumber": row[4],
+							"provinceOfLoading": row[5],
+							"shipper": {
+								"name": row[6],
+								"address": {
+									"addressLine": row[7],
+									"country": row[8],
+									"city": row[9],
+									"stateProvince": row[10],
+									"postalCode": row[11].zfill(5)
+								}
+							},
+							"consignee": {
+								"name": row[12],
+								"address": {
+									"addressLine": row[13],
+									"country": row[14],
+									"city": row[15],
+									"stateProvince": row[16],
+									"postalCode": row[17].zfill(5)
+								}
+							},
+							"client": row[18],
+							"carrier": row[19],
+							"closeDate": row[20],
+							"trackingNumber": row[21],
+							"GAYLORD": row[22],
+							"commodities": []
+						}
+
+				for row in csv_data: #Searches for commodities that match consignee
+					if consignee == row[4]:
+						commodity = {}
+						if len(row) == 30: #If the entry has value and countryOfOrigin
+							commodity = {
+								"description": row[23],
+								"quantity": float(row[24]),
+								"packagingUnit": row[25],
+								"weight": int(row[26]),
+								"weightUnit": row[27],
+								"value": row[28],
+								"countryOfOrigin": row[29]
+							}
+						elif len(row) == 29: #If it has only value
+							commodity = {
+								"description": row[23],
+								"quantity": float(row[24]),
+								"packagingUnit": row[25],
+								"weight": int(row[26]),
+								"weightUnit": row[27],
+								"value": row[28],
+							}
+						else:
+							commodity = {
+								"description": row[23],
+								"quantity": float(row[24]),
+								"packagingUnit": row[25],
+								"weight": int(row[26]),
+								"weightUnit": row[27]
+							}
+						entry["commodities"].append(commodity)
+				out_json.append(entry)
+				filepath = "ACE_Manifest_(JSON).json"
+			with open(filepath, "w") as json_file:
+				json.dump(out_json, json_file, indent=4)
+			app.infoBox("Done", "Done converting CSV to JSON.\nOutputting to {}".format(filepath))
+	except:
+		errorBox("Error converting from CSV to JSON.\nPlease see console for more details")
+
+def jsonBeautifier():
+	#Adds indents to the JSON to make it human-readable
+	try:
+		json_file_name = app.getEntry("Ugly JSON")
+		with open(json_file_name, "r") as json_file:
+			json_data = json.load(json_file)
+		with open(json_file_name, "w") as json_file:
+			json.dump(json_data, json_file, indent = 4)
+		app.infoBox("Done", "Done formatting JSON.\nOutputting to {}".format(json_file_name))
+	except:
+		errorBox("Error beautifying JSON. Make sure uploaded file was valid JSON")
+	
+def combineJSON():
+	#Combines 2 JSONs
+	out_data = []
+	with open(app.getEntry("JSON 1"), "r") as json_file_1:
+		json_data_1 = json.load(json_file_1)
+	with open(app.getEntry("JSON 2"), "r") as json_file_2:
+		json_data_2 = json.load(json_file_2)
+	for line in json_data_1:
+		out_data.append(line)
+	for line in json_data_2:
+		out_data.append(line)
+	with open("ACE_Manifest_(Combined).json", "w") as json_file:
+		json.dump(out_data, json_file, indent = 4)
+	app.infoBox("Done", "Done combining JSONs.\nOutputting to \"ACE_Manifest_(Combined).json\"")
 
 def createUSGR():
-	print("\n>Preparing USGR")
-	with open(os.getcwd() + os.sep + "resources" + os.sep + "USGR_MASTER_LIST.csv", "r") as USGR_master_file:
+	#USGR is paperwork for all the FDA-regulated products that return to the US. For Customs purposes or something
+	USGR_date = app.getEntry("USGR Date:")
+	USGR_BoL = app.getEntry("USGR BoL #:")
+	USGR_entry = app.getEntry("USGR Entry Number:")
+
+	with open("resources/USGR_MASTER_LIST.csv", "r") as USGR_master_file:
 		csv_reader = csv.reader(USGR_master_file, delimiter = ',')
-		master_data = []
+		usgr_data = []
 		for row in csv_reader:
-			master_data.append(row)
+			usgr_data.append(row)
 
 	with open(app.getEntry("ProForma Template:"), "r") as proforma_file:
 		csv_reader = csv.reader(proforma_file, delimiter = ',')
@@ -986,17 +1068,19 @@ def createUSGR():
 		for row in csv_reader:
 			proforma_data.append(row)
 
+	#Compares the USGR template data to the USGR Master list. If an item matches and originates from the US, add it to the output data
 	out_data = []
 	for line in proforma_data:
-		for row in master_data:
+		for row in usgr_data:
 			if line[0] == row[1] and row[10] == "US": #If ProForma SKU matches a SKU from the master file
 				out_data.append((row[1], row[13], row[16], row[20], row[21], line[11], line[1], row[2], "BUFFALO", "US"))
 	
-	file_name = os.getcwd() + os.sep + "USGR" + os.sep + app.getEntry("USGR Date:") + "-USGR_Table-" + app.getEntry("USGR Entry Number:") + ".pdf"
+	#Creates the main USGR information chart
+	file_name = "USGR" + os.sep + USGR_date + "-USGR_Table-" + USGR_entry + ".pdf"
 	c = canvas.Canvas(file_name, pagesize = (595.27, 841.89), bottomup = 1)
 	c.setFont("Courier", 7)
 	c.drawString(10, 820, "US GOODS RETURNED")
-	c.drawString(10, 812, "INVOICE REFERENCE #: {}    ENTRY #: {}    DATE: {}".format(app.getEntry("USGR BoL #:"), app.getEntry("USGR Entry Number:"), app.getEntry("USGR Date:")))
+	c.drawString(10, 812, "INVOICE REFERENCE #: {}    ENTRY #: {}    DATE: {}".format(USGR_BoL, USGR_entry, USGR_date))
 	c.drawString(10, 800, "PART/ITEM #       DESCRIPTION                     MANUFACTURER           CITY, STATE           VALUE     QTY  IMPORTDATE  ENTRY PORT")
 	for i, row in enumerate(out_data, start = 1):
 		out = ""
@@ -1011,9 +1095,10 @@ def createUSGR():
 		c.drawString(10, (800 - (i * 8)), str(out))
 	c.showPage()
 
+	#Attaches all 6 of the the USGR documents. Adds Entry Number + BoL Number to some of the pages
 	c.setFont("Courier", 12)
 	for i in range(1, 7): #1 through 6 inclusive
-		filepath = os.getcwd() + os.sep + "resources" + os.sep + "page_" + str(i) + ".jpg"
+		filepath = "resources" + os.sep + "page_" + str(i) + ".jpg"
 		image = Image.open(filepath)
 		c.drawImage(ImageReader(image), 0, 0, 595.27, 841.89)
 		if i == 1:
@@ -1028,79 +1113,113 @@ def createUSGR():
 		c.showPage()
 
 	c.save()
-	print(">>USGR Completed for " + app.getEntry("USGR Date:"))
 
-def updateUSGRdata():
-	app.setEntry("USGR Date:", app.getEntry("Date:"))
-	app.setEntry("USGR BoL #:", app.getEntry("BoL #:"))
+## Utility Functions
 
-def copyPaperwork():
-	print("\n>Attempting to copy paperwork")
-	try:
-		date = app.getEntry("Date:")
-		src = os.getcwd() + os.sep + date
-		year = date.split("-")[0]
-		month = date.split("-")[1]
-		dst = "W:\\Logistics\\USPS Customs\\USPS Customs Paperwork\\IMS Invoices - Mixed Shipments\\{year}\\{month}\\{date}".format(year = year, month = month, date = date)
-		if not os.path.exists(dst):
-			os.mkdir(dst)
-		copyTree(src, dst)
-		print(">>Paperwork copying completed")
-	except:
-		errorBox("Copying files failed!")
+def cleanCommoditiesList(commodities_list):
+	#Some products are shipped in multi-packs under different SKUs
+	#This properly calculates the amount of product shipped based on SKU quantities
+	#To add products, take the Description from the ACE Manifest
+	#No need to set quantities of added products to 0 as the items aren't in the Master FDA file and can't be added to the ProForma
+	try: commodities_list["Eye Renew 0.5 fl oz Skin Care"] += commodities_list["BDRx Kit"]
+	except:	pass
+	try: commodities_list["Flawless Face 2 fl oz"] += commodities_list["BDRx Kit"]
+	except:	pass
+	try: commodities_list["Instalift 0.5 fl oz"] += commodities_list["BDRx Kit"]
+	except:	pass
+	try: commodities_list["Tevida 60 caps - US"] += commodities_list["Tevida "]
+	except:	pass
+	try: commodities_list["Vascular X 60 caps - US"] += commodities_list["Vascular X"]
+	except:	pass
 
-def copyTree(src, dst, symlinks=False, ignore=None): #Stolen from SlackOverflow
-    for item in os.listdir(src):
-        s = os.path.join(src, item)
-        d = os.path.join(dst, item)
-        if os.path.isdir(s):
-            shutil.copytree(s, d, symlinks, ignore)
-        else:
-            shutil.copy2(s, d)	
+	return commodities_list
 
-def saveMasterData():
-	pass
+def createOutputFolder(folder_string):
+	folder_path = os.getcwd() + os.sep + folder_string
+	if not os.path.exists(folder_path):
+		os.mkdir(folder_path)
 
-def loadMasterData():
-	pass
+def cleanString(in_string):
+	return "".join(c for c in in_string if c in "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ ")
 
+def errorBox(input_string):
+	app.errorBox("ErrorBox", input_string)
+	try: traceback.print_exc()
+	except: pass
+
+def checkFiles():
+	return_flag = True
+	if app.getEntry("batchesFileEntry") == "":
+		errorBox("No Batches Scans file selected")
+		return_flag = False
+	if app.getEntry("ACEManifestFileEntry") == "":
+		errorBox("No ACE Manifest file selected")
+		return_flag = False
+	if app.getEntry("XLSXReportFileEntry") == "":
+		errorBox("No XLSX Report file selected")
+		return_flag = False
+	if app.getEntry("batchesFileEntry")[-4] != ".csv":
+		errorBox("Batches Scans is not .csv")
+		return_flag = False
+	if app.getEntry("ACEManifestFileEntry")[-5] != ".json":
+		errorBox("ACE Manifest is not .json")
+		return_flag = False
+	if app.getEntry("XLSXReportFileEntry")[-5] != ".xlsx":
+		errorBox("XLSX Report is not .csv")
+		return_flag = False
+	return return_flag
+''' Legacy, needs re-write
+def updateIMSTracker():
+	global master_metadata
+	fedex_out = []
+	dhl_out = []
+	for g in master_metadata["gaylords_assignments"]:
+		if g[1] == "DHLGLOBALMAIL":
+			dhl_out.append(g[0])
+		elif g[1] == "FEDEX":
+			fedex_out.append(g[0])
+
+	values = gAPI.main(fedex_in = fedex_out, dhl_in = dhl_out)
+	print(values)
+'''
 ### Start
 
-print("LogisticsManager.py v1.0")
+print("LogisticsManager.py v2.0")
 
-## Global variables
-debug_flag = False
-detailed_report_json = []
-data = {}
-master_json_data = []
-ACE_data = {}
-gaylords_assignments = []
-fedex_package_count = 0
+## NEW Global Variables
+consolidated_ACE_data = []
+master_ACE_data = []
+master_metadata = {}
+config_data = {}
 
 ## Start GUI
 app = gui()
 
 app.startTabbedFrame("TabbedFrame")
-app.setSticky("nw")
-app.setStretch("none")
+app.setSticky("nesw")
+app.setStretch("column")
 
 ## Frame 1
 app.startTab("BASIC")
 
 app.startLabelFrame("Date/BoL/PAPS")
+app.addButton("TEST BUTTON", testButton)
 app.addLabel("W:\\Logistics\\Carrier Tracking\\USPS Tracking.xlsx")
 app.addLabelEntry("Date:")
 app.addLabelEntry("BoL #:")
 app.addLabelEntry("PAPS #:")
+app.addButton("+1 BoL #/PAPS #", increaseVariables)
+app.addButton("-1 BoL #/PAPS #", decreaseVariables)
+app.addButton("Save BoL #/PAPS #", saveVariables)
 app.stopLabelFrame()
 
 app.startLabelFrame("Step 1")
 app.addLabel("ACE Manfiest (from Techship, \"ace_manifest_#\"):")
 app.addFileEntry("ACEManifestFileEntry")
-app.addLabel("Batches Scans:")
+app.addLabel("Detailed Report:")
 app.addFileEntry("batchesFileEntry")
-app.addLabel("Report CSV (from Techship, \"manifest_packages_#\"):")
-app.addFileEntry("CSVReportFileEntry")
+app.addLabel("Report XLSX (from Techship, \"manifest_packages_#\"):")
+app.addFileEntry("XLSXReportFileEntry")
 app.addButton("Create Paperwork", doEverything)
 app.stopLabelFrame()
 
@@ -1108,67 +1227,31 @@ app.startLabelFrame("Step 2:")
 app.addLabel("ProForma (Printed from SmartBorder):")
 app.addFileEntry("ProFormaFileEntry")
 app.addButton("Email Paperwork", emailPaperwork)
+#app.addButton("Update IMS Tracker", updateIMSTracker)
 app.addButton("Move Paperwork to W: Drive", copyPaperwork)
 app.stopLabelFrame()
-
 app.stopTab()
 
 ## Frame 2
-app.startTab("ADVANCED")
-
-app.startLabelFrame("Variables (Auto-generated, manually-editable)")
-app.addLabelEntry("SCAC:")
-app.addLabelEntry("Total Gaylord Count:")
-app.addLabelEntry("Package Count:")
-app.addLabelEntry("Total Weight:")
-app.addLabelEntry("USPS Gaylord Count:")
-app.addLabelEntry("DHL Gaylord Count:")
-app.addLabelEntry("FedEx Gaylord Count:")
-app.stopLabelFrame()
-
-app.startLabelFrame("Advanced Buttons")
-app.addButton("Load Master Data", loadMasterData)
-app.addButton("Save Master Data", saveMasterData)
-app.addButton("Advance (increase by 1) BoL #/PAPS #", updateVariables)
-app.addButton("Save BoL #/PAPS #", saveVariables)
-app.addButton("Create Master JSON", createMasterJSON)
-app.addButton("Create ACE and Detailed Report", createACE)
-app.addButton("Create ProForma", createProForma)
-app.addButton("Create Load Sheet", createLoadSheet)
-app.addButton("Create BoL", createBoL)
-app.addButton("Create IMS BoL", createIMSBoL)
-app.addButton("Email Papers", emailPaperwork)
-app.stopLabelFrame()
-
-app.stopTab()
-
-## Frame 3
 app.startTab("ACE EDITING")
+
 app.startLabelFrame("ACE Manifest")
 app.addLabel("ACE Manifest (.json):")
 app.addFileEntry("ACEManifestFileEntry2")
+app.addLabelEntry("File Date:")
 app.addButton("Load ACE", loadACEManifest)
 app.addLabel("ACEStatusLabel", "No ACE Loaded")
-app.stopLabelFrame()
-
-app.startLabelFrame("Entry Editing")
-app.addLabelEntry("SCN #:")
-app.addButton("Load Entry", loadACEEntry)
-app.addLabelEntry("ORDERID:")
-app.addLabelEntry("BATCHID:")
-app.addLabelEntry("NAME:")
-app.addLabelEntry("ADDRESS:")
-app.addLabelEntry("COUNTRY:")
-app.addLabelEntry("CITY:")
-app.addLabelEntry("STATE:")
-app.addLabelEntry("POSTALCODE:")
-app.addLabelEntry("GAYLORD:")
-app.addButton("Save Entry", saveACEManifest)
 app.stopLabelFrame()
 
 app.startLabelFrame("Gaylord Removal")
 app.addLabelEntry('Gaylord (eg. "G1"):')
 app.addButton("Remove Gaylord", removeGaylord)
+app.stopLabelFrame()
+
+app.startLabelFrame("Batch/Order Removal")
+app.addLabel('Batches/Orders:')
+app.addTextArea("batchesTextArea")
+app.addButton("Remove Items", removeItems)
 app.stopLabelFrame()
 
 app.startLabelFrame("Duplicate SCN Editor")
@@ -1179,32 +1262,14 @@ app.stopLabelFrame()
 
 app.stopTab()
 
-## Frame 4
-app.startTab("EMAIL TEXT")
-app.startLabelFrame("Email Editing:")
-app.setStretch("both")
-app.setSticky("nesw")
-app.addTextArea("EmailTextArea", text = "Morning\n\nPlease see attached paperwork for today\nPickup is available 9am next business day")
-app.setSticky("ws")
-app.addButton("Send Custom Email", emailPaperwork)
-app.stopLabelFrame()
-app.stopTab()
+## Frame 3
+app.startTab("ADVANCED")
 
-## Frame 5
-
-app.startTab("MANUAL EDIT")
-app.startLabelFrame("Manual Editing:")
+app.startLabelFrame("Convert ACE to EXCEL:")
 app.addLabelFileEntry("JSON")
 app.addButton("Convert to CSV", convertJSONToCSV)
 app.addLabelFileEntry("CSV")
 app.addButton("Convert to JSON", convertCSVToJSON)
-app.stopLabelFrame()
-
-app.startLabelFrame("Batch Removal")
-app.addLabelFileEntry("ACE")
-app.addLabel("Batches/Transactions")
-app.addTextArea("ordersTextArea")
-app.addButton("Remove/Split", removeOrders)
 app.stopLabelFrame()
 
 app.startLabelFrame("JSON Formatter")
@@ -1217,10 +1282,17 @@ app.addLabelFileEntry("JSON 1")
 app.addLabelFileEntry("JSON 2")
 app.addButton("Combine", combineJSON)
 app.stopLabelFrame()
+
+app.startLabelFrame("Email Editing:")
+app.setStretch("both")
+app.setSticky("nesw")
+app.addTextArea("EmailTextArea", text = None)
+app.setSticky("ws")
+app.addButton("Send Custom Email", emailPaperwork)
+app.stopLabelFrame()
 app.stopTab()
 
-## USGR
-
+## Frame 4
 app.startTab("USGR")
 app.startLabelFrame("USGR")
 app.addLabelFileEntry("ProForma Template:")
@@ -1231,14 +1303,11 @@ app.addButton("Create USGR", createUSGR)
 app.stopLabelFrame()
 app.stopTab()
 
-## Finish
+## Finish GUI
 app.stopTabbedFrame()
 
 ### Setup
 
 loadVariables()
-updateVariables()
-app.setEntry("SCAC:", "TAIW")
-updateUSGRdata()
 
 app.go()
