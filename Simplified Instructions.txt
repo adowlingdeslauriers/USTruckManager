@@ -1,0 +1,100 @@
+This is a quick overview on how to test USTM.py to make sure everything is working as intended
+For a more detailed (but out-of-date) guide, please consult "USTM User Guide.docx" which describes what the user deals with
+For a more detailed understanding of the insides of USTM, please see source code.
+
+PAGE 1: BASIC
+=============
+
+Everything
+----------
+1. Set date/BoL/PAPS or use default values
+
+2. Upload the ACE Manifest under "ACE Manifest"
+ACE Manifest contains pretty much all the shipping data (eg. shipper, receiver, products, etc)
+ACE Manifest is downloaded from techship > Orders > Manifest History > ("Download" Dropdown menu) > "Download ACE Manifest"
+Sample document is "1-ACE.json" in /Test Files/
+
+3. Upload the Detailed Report under "Detailed Report"
+Contains all the batches/orders that have been scanned (confirmed on the truck) and the gaylord said package has been place in
+Detailed Report is a template filled by user
+Sample document is "2-Detailed_Report.xlsx" in /Test Files/
+
+4. Upload the XLSX Report under "Report XLSX"
+XLSX Report contains tracking numbers, carrier, client, etc, drastically simplifying the filtering process
+XLSX Report is downloaded from techship > Orders > Manifest History > ("Download" Dropdown menu) > "Download report XLSX (50000 rows max)"
+Sample document is "3-XLSX-Report.xlsx"
+
+5. Click "Create Paperwork". USTM may give you 0-2 error boxes for the following:
+	Unmatched Batch (Detailed Report lists an order that was not declared on the ACE manifest)
+	Unmatched Entry (ACE manifest has an entry that does not match a scanned batch. Said entry is removed from the ACE manifest)
+Any other errors are for technical errors (bad code, improperly entered data, missing files, etc)
+
+USTM Should generate the following files in the folder specified by the "date" field (entered above):
+	/date/[date]-ACE.json
+		Should contain valid JSON shipping entries
+	/date/[date]-Detailed_Report.csv
+		Should be a spreadsheet of packages and their shipping data
+	/date/[date]-IMS-BoL.pdf
+		Should list number and breakdown of which gaylords are headed to FedEx/DHL
+	/date/[date]-Load_Sheet.pdf
+		Should list every gaylord that has an entry in the detailed report (aka. every gaylord shipping) along with which carrier, package count, and if the gaylord contains at least 1 FDA-regulated package
+	/date/[date]-ProForma_Template.xlsx
+		Should contain the same products* and amounts* you get if you download the Manifest Items report (techship > Reports > Manifest Items > enter in the Manifest Id)
+		*Notes that USTM only counts products that are confirmed to have shipped for that day. On 90% of days (and thus 90% of sample data you can draw from) there should be no difference between the two (manifested and shipped). If a new product is added to the master FDA list make sure it ends up here when testing is done
+	/date/[date]-Stalo-BoL.pdf
+		Make sure date, BoL, PAPS, gaylord counts, package count are all there
+	/date/[date]-USGR_Data.csv
+		Used for customs purposes. Not essential. Contains all the US-manufactured products seen on the ProForma_Template
+
+6. For testing purposes you can skip this step. Just upload any file that ends with .pdf
+Upload ProForma template to SmartBorder (Proforma > Import Proformas (on the left bar) > Next > Drag and Drop. Ignore "No IncludesFreight" error > Import > View all Proformas > Select top-most Proforma. Validate > Save > Post to Broker > (wait) > Print. Upload the proforma in USTM
+
+7. Click "Email Paperwork" and enter your outlook email username, then password
+USTM will email everyone under the "emailRecipients" key in /resources/CONFIG.json with the 4 documents entered above
+If there are any FedEx packages, this will also email the address listed under "fedexContact"
+
+PAGE 2: ACE EDITING
+===================
+
+ACE Manifest:
+-------------
+Upload a valid ACE Manifest and click "Load ACE". Loading is successful if label reads "X entries loaded"
+
+Gaylord Removal
+---------------
+After uploading an ACE, enter in the gaylord (eg. "G12") you would like to remove. Will report the amount of packages removed from the ACE. Also creates a file with all the removed orders whose filename ends with "-REMOVED_GAYLORDS"
+
+Loops through all entries in the ACE and removes the ones where "GAYLORD" matches the entrybox
+
+Batches/Order Removal
+---------------------
+After uploading an ACE, enter in the batches/orders (one per line, or split by commas) you would like to remove from the ACE Manifest. Will report the amount of packages removed from the ACE.  Also creates a file with all the removed orders whose filename ends with "-REMOVED_ORDERS"
+
+Duplicate SCN Editor
+--------------------
+After uploading an ACE, enter in 2 digits (eg. 42) you would like to be the new ending of the 16-character long Shipment Control Numbers for all the entries in the ACE (The SCN consists of a 4-letter carrier code, 10 unique identifying digits, and finally 2 "empty" digits for this purpose)
+
+Page 3: ADVANCED
+================
+
+Convert ACE to EXCEL
+--------------------
+Should convert an ACE to a CSV file, allowing for easy editing. All fields from the ACE should successfully be moved to the CSV.
+
+Also converts a CSV back to JSON.
+
+JSON Formatter
+--------------
+Literally reads the JSON and dumps it back out to the same file, but with indents.
+
+JSON Combiner
+-------------
+Exactly what it says on the tin. Converts the JSON to 2 dictionaries, merges them, spits them back out.
+
+Email Editing
+-------------
+Allows one to manually edit the first half of the email sent out. Default text is in /resources/CONFIG.json
+
+PAGE 4: USGR
+============
+Creates a simple text-based spreadsheet of all FDA-regulated products that were manufactured in the US that are returning to the US. Then appends 6 forms with Entry number and date.
