@@ -1,101 +1,73 @@
 {
-    "BoL": "4295193",
-    "PAPS": "001285",
+    "date": "2021-05-27",
+    "BoL": "4295286",
+    "PAPS": "001377",
     "SCAC": "TAIW",
-	
-	"XLSX_Report_ORDERID_column_name": "Pick Order",
-	"XLSX_Report_client_name_column_name": "Client Name",
-	"XLSX_Report_carrier_column_name": "Carrier",
-	"XLSX_Report_ship_date_column_name": "Ship Date",
-	"XLSX_Report_tracking_number_column_name": "Tracking Number",
-	"BATCHES_SCANS_batch_column_name": "Batch",
-	"BATCHES_SCANS_gaylord_column_name": "Gaylord",
-	"Detailed_Report_scan_sheet_name": "Scan Here",
-	"Detailed_Report_batch_column_name": "Batch",
-	"Detailed_Report_gaylord_column_name": "Gaylord",
-	
-	"default_email_message": "Morning\n\nPlease see attached paperwork for today\nPickup is available 9am next business day",
-
-    "_comment": "cleanCommoditiesList() matches the value (interpreted as a string) and converts that item's quantity to the key's quantity. Super bad coding practise but it works and is easy enough for an even-more novice to add given appropriate instruction",
+    "XLSX_Report_ORDERID_column_name": "Pick Order",
+    "XLSX_Report_client_name_column_name": "Client Name",
+    "XLSX_Report_carrier_column_name": "Carrier",
+    "XLSX_Report_ship_date_column_name": "Ship Date",
+    "XLSX_Report_tracking_number_column_name": "Tracking Number",
+    "BATCHES_SCANS_batch_column_name": "Batch",
+    "BATCHES_SCANS_gaylord_column_name": "Gaylord",
+    "Detailed_Report_scan_sheet_name": "Scan Here",
+    "Detailed_Report_batch_column_name": "#Batch",
+    "Detailed_Report_gaylord_column_name": "#Gaylord",
+    "default_email_message": "Morning\n\nPlease see attached paperwork for today\nPickup is available 9am next business day\nDHL DSMs have been attached to G",
+    "_comment1": "cleanCommoditiesList() matches the dict's Value and converts that item's quantity to the Key's quantity. Super bad coding practise but it works and is easy enough for a novice to add given appropriate instruction",
+    "_comment2": "Left: product to be converted to. Right: Product to be converted from",
     "commodity_conversions": {
         "Eye Renew 0.5 fl oz Skin Care": "BDRx Kit",
         "Flawless Face 2 fl oz": "BDRx Kit",
         "Instalift 0.5 fl oz": "BDRx Kit",
         "Tevida 60 caps - US": "Tevida ",
-        "Vascular X 60 caps - US": "Vascular X"
+        "Vascular X 60 caps - US": "Vascular X",
+        "Age Defy Clear Bottles 1 fl oz": "Age Defy - Kit"
     },
-
-    "USPS_carriers_names": [],
+    "USPS_carriers_names": [
+        "EHUB"
+    ],
     "DHL_carriers_names": [
         "DHLGLOBALMAIL",
         "DHLGLOBALMAILV4"
     ],
-    "FEDEX_carriers_names": [],
-	
-    "emailRecipients": [
-        {
-            "emailAddress": "chris@stalco.ca"
-        },
-        {
-            "emailAddress": "naseer@stalco.ca"
-        },
-        {
-            "emailAddress": "TLCUS@tri-ad.ca"
-        },
-        {
-            "emailAddress": "diana@stalco.ca"
-        },
-        {
-            "emailAddress": "exports@tri-ad.ca"
-        },
-        {
-            "emailAddress": "lcollier@tri-ad.ca"
-        },
-        {
-            "emailAddress": "santosh@stalco.ca"
-        },
-        {
-            "emailAddress": "lorne@stalco.ca"
-        },
-        {
-            "emailAddress": "mcole@IMSDirect.com"
-        },
-        {
-            "emailAddress": "SSchiano@imsdirect.com"
-        },
-        {
-            "emailAddress": "dcox@tri-ad.ca"
-        },
-        {
-            "emailAddress": "release@cbcustomsbrokerage.com"
-        },
-        {
-            "emailAddress": "james@stalco.ca"
-        },
-        {
-            "emailAddress": "Sai@stalco.ca"
-        },
-        {
-            "emailAddress": "bayotte@tri-ad.ca"
-        },
-        {
-            "emailAddress": "mAyotte@tri-ad.ca"
-        },
-        {
-            "emailAddress": "slima@tri-ad.ca"
-        },
-        {
-            "emailAddress": "dcrocker@IMSDirect.com"
-        },
-        {
-            "emailAddress": "ELindo@IMSDirect.com"
-        },
-        {
-            "emailAddress": "flavia@stalco.ca"
-        },
-        {
-            "emailAddress": "alex@stalco.ca"
-        }
+    "FEDEX_carriers_names": [
+        "FEDEX"
     ],
-    "fedexContact": "jennifer.dressel@fedex.com"
+    "_emailRecipients": [
+        "alex@stalco.ca"
+    ],
+    "emailRecipients": [
+        "chris@stalco.ca",
+        "naseer@stalco.ca",
+        "TLCUS@tri-ad.ca",
+        "diana@stalco.ca",
+        "exports@tri-ad.ca",
+        "lcollier@tri-ad.ca",
+        "lorne@stalco.ca",
+        "mcole@IMSDirect.com",
+        "SSchiano@imsdirect.com",
+        "dcox@tri-ad.ca",
+        "release@cbcustomsbrokerage.com",
+        "james@stalco.ca",
+        "Sai@stalco.ca",
+        "bayotte@tri-ad.ca",
+        "mAyotte@tri-ad.ca",
+        "slima@tri-ad.ca",
+        "dcrocker@IMSDirect.com",
+        "ELindo@IMSDirect.com",
+        "flavia@stalco.ca"
+    ],
+    "fedexContact": "jennifer.dressel@fedex.com",
+    "_fedexContact": "alex@stalco.ca",
+    "consigneeOverrideAddress": {
+        "addressLine": "2540 Walden Ave Suite 450",
+        "country": "US",
+        "city": "Buffalo",
+        "stateProvince": "NY",
+        "postalCode": "14225"
+    },
+    "warnable_clients": [
+        "JSC Ekomlita"
+    ]
 }
